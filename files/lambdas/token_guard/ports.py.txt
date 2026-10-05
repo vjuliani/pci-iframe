@@ -1,0 +1,16 @@
+from typing import Protocol
+
+from .models import GuardRequest, VerifiedToken
+
+
+class TokenVerifier(Protocol):
+    def verify(self, token: str) -> VerifiedToken:
+        ...
+
+    def revoke(self, token: str) -> None:
+        ...
+
+
+class ReplayStore(Protocol):
+    def consume(self, *, token_hash: str, request: GuardRequest, verified: VerifiedToken) -> dict:
+        ...

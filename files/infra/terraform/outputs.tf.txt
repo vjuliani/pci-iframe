@@ -1,0 +1,19 @@
+output "api_id" {
+  value = aws_api_gateway_rest_api.checkout.id
+}
+
+output "api_base_url" {
+  value = "http://${aws_api_gateway_rest_api.checkout.id}.execute-api.localhost.localstack.cloud:4566/${aws_api_gateway_stage.local.stage_name}"
+}
+
+output "sessions_table" {
+  value = aws_dynamodb_table.sessions.name
+}
+
+output "token_ledger_table" {
+  value = aws_dynamodb_table.token_ledger.name
+}
+
+output "token_guard_lambda" {
+  value = aws_lambda_function.authorizer.function_name
+}

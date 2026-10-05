@@ -1,0 +1,137 @@
+services:
+  hydra-postgres:
+    image: postgres:16-alpine
+    container_name: pci-hydra-postgres
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: hydra
+      POSTGRES_DB: hydra
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - hydra-db:/var/lib/postgresql/data
+    networks: [pci-checkout]
+
+  hydra-migrate:
+    image: oryd/hydra:v2.3.0
+    container_name: pci-hydra-migrate
+    command: migrate sql -e --yes
+    environment:
+      DSN: postgres://hydra:hydra@hydra-postgres:5432/hydra?sslmode=disable
+    depends_on:
+      hydra-postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [pci-checkout]
+
+  hydra:
+    image: oryd/hydra:v2.3.0
+    container_name: pci-checkout-hydra
+    command: serve all --dev
+    ports:
+      - "4444:4444"
+      - "4445:4445"
+    environment:
+      DSN: postgres://hydra:hydra@hydra-postgres:5432/hydra?sslmode=disable
+      URLS_SELF_ISSUER: http://hydra:4444/
+      SECRETS_SYSTEM: dev-hydra-system-secret-change-me-32bytes-minimum
+      STRATEGIES_ACCESS_TOKEN: opaque
+      TTL_ACCESS_TOKEN: 2m
+      OAUTH2_EXPOSE_INTERNAL_ERRORS: "true"
+      LOG_LEVEL: debug
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    networks: [pci-checkout]
+
+  localstack:
+    image: localstack/localstack:2026.9.0
+    container_name: pci-checkout-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: lambda,apigateway,dynamodb,iam,logs,sts
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+      DEBUG: ${DEBUG:-0}
+      PERSISTENCE: "1"
+      LAMBDA_KEEPALIVE_MS: "600000"
+      LAMBDA_DOCKER_NETWORK: pci-checkout-net
+      MAIN_DOCKER_NETWORK: pci-checkout-net
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [pci-checkout]
+
+  token-guard-adapter:
+    build:
+      context: .
+      dockerfile: services/token-guard-adapter/Dockerfile
+    container_name: pci-token-guard-adapter
+    profiles: ["local-adapter"]
+    ports:
+      - "8890:8890"
+    environment:
+      PORT: "8890"
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      TOKEN_LEDGER_TABLE: pci-ephemeral-token-ledger
+      HYDRA_ADMIN_URL: http://hydra:4445
+      HYDRA_PUBLIC_URL: http://hydra:4444
+      HYDRA_CLIENT_ID: pci-checkout-exchange
+      HYDRA_CLIENT_SECRET: dev-pci-checkout-hydra-secret-please-change-32bytes
+      HYDRA_SCOPE: payment.execute
+      CHECKOUT_LAMBDA_NAME: pci-payment-checkout
+      ALLOWED_ORIGIN: http://localhost:8881
+    depends_on: [localstack, hydra]
+    networks: [pci-checkout]
+
+  merchant-backend:
+    build: ./services/merchant-backend
+    container_name: pci-merchant-backend
+    ports:
+      - "3002:3002"
+    environment:
+      PORT: "3002"
+      MERCHANT_PRIVATE_KEY_FILE: /run/secrets/merchant/merchant-private.pem
+      MERCHANT_PUBLIC_KEY_FILE: /run/secrets/merchant/merchant-public.pem
+      MERCHANT_JWT_ISSUER: merchant-demo
+      MERCHANT_JWT_AUDIENCE: checkout-session-service
+      CHECKOUT_SESSION_API_BASE_URL: ${CHECKOUT_SESSION_INTERNAL_API_BASE_URL:-http://localstack:4566/local}
+      PAYMENT_PUBLIC_API_BASE_URL: ${PAYMENT_PUBLIC_API_BASE_URL:-http://REPLACE_API_ID.execute-api.localhost.localstack.cloud:4566/local}
+      API_GATEWAY_HOST: ${API_GATEWAY_HOST:-REPLACE_API_ID.execute-api.localhost.localstack.cloud:4566}
+      PCI_IFRAME_URL: http://localhost:8881/
+      FRONTEND_ORIGIN: http://localhost:8880
+      DEMO_MODE: "true"
+    volumes:
+      - ./secrets:/run/secrets/merchant:ro
+    depends_on: [localstack, hydra]
+    networks: [pci-checkout]
+
+  merchant-frontend:
+    build: ./services/merchant-frontend
+    container_name: pci-merchant-frontend
+    ports:
+      - "8880:80"
+    depends_on: [merchant-backend]
+    networks: [pci-checkout]
+
+  pci-hosted-fields:
+    build: ./services/pci-hosted-fields
+    container_name: pci-hosted-fields
+    ports:
+      - "8881:80"
+    networks: [pci-checkout]
+
+volumes:
+  localstack-data:
+  hydra-db:
+
+networks:
+  pci-checkout:
+    name: pci-checkout-net

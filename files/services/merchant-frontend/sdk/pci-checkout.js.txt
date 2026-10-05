@@ -1,0 +1,37 @@
+export class PciCheckout {
+  constructor({iframeUrl, target, allowedOrigin}) {
+    this.iframeUrl = iframeUrl;
+    this.target = target;
+    this.allowedOrigin = allowedOrigin || new URL(iframeUrl).origin;
+    this.loaded = false;
+  }
+  mount() {
+    const iframe = document.createElement('iframe');
+    iframe.src = this.iframeUrl;
+    iframe.title = 'Secure card fields';
+    iframe.allow = 'payment *';
+    iframe.style.cssText = 'width:100%;height:390px;border:0;border-radius:14px;background:white';
+    iframe.addEventListener('load', () => {
+      this.loaded = true;
+      if (this.pendingConfig) this._send(this.pendingConfig);
+    });
+    this.target.replaceChildren(iframe);
+    this.iframe = iframe;
+    return this;
+  }
+  _send(config) {
+    this.iframe.contentWindow.postMessage({type:'pci:init', ...config}, this.allowedOrigin);
+  }
+  configure(config) {
+    this.pendingConfig = config;
+    if (this.loaded) this._send(config);
+    return this;
+  }
+  onResult(handler) {
+    window.addEventListener('message', e => {
+      if (e.origin !== this.allowedOrigin || e.source !== this.iframe?.contentWindow) return;
+      if (e.data?.type === 'pci:payment-result') handler(e);
+    });
+    return this;
+  }
+}

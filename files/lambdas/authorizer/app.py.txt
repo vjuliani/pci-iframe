@@ -1,0 +1,85 @@
+import json
+import os
+
+from token_guard.adapters.aws_request import from_api_gateway
+from token_guard.core import EphemeralTokenGuard
+from token_guard.errors import GuardError
+from token_guard.providers.hydra import HydraTokenProvider
+from token_guard.stores.dynamodb import DynamoDbReplayStore
+
+TOKEN_LEDGER_TABLE = os.environ['TOKEN_LEDGER_TABLE']
+AWS_ENDPOINT_URL = os.getenv('AWS_ENDPOINT_URL')
+HYDRA_ADMIN_URL = os.environ['HYDRA_ADMIN_URL']
+HYDRA_PUBLIC_URL = os.environ['HYDRA_PUBLIC_URL']
+HYDRA_CLIENT_ID = os.environ['HYDRA_CLIENT_ID']
+HYDRA_CLIENT_SECRET = os.environ['HYDRA_CLIENT_SECRET']
+HYDRA_SCOPE = os.getenv('HYDRA_SCOPE', 'payment.execute')
+
+
+def policy(effect, method_arn, context=None, principal_id='checkout-session'):
+    result = {
+        'principalId': principal_id,
+        'policyDocument': {
+            'Version': '2012-10-17',
+            'Statement': [{
+                'Action': 'execute-api:Invoke',
+                'Effect': effect,
+                'Resource': method_arn,
+            }],
+        },
+    }
+    if context:
+        result['context'] = {k: str(v) for k, v in context.items() if v is not None}
+    return result
+
+
+def build_guard():
+    provider = HydraTokenProvider(
+        admin_url=HYDRA_ADMIN_URL,
+        public_url=HYDRA_PUBLIC_URL,
+        client_id=HYDRA_CLIENT_ID,
+        client_secret=HYDRA_CLIENT_SECRET,
+        required_scope=HYDRA_SCOPE,
+    )
+    store = DynamoDbReplayStore(
+        table_name=TOKEN_LEDGER_TABLE,
+        endpoint_url=AWS_ENDPOINT_URL,
+    )
+    return EphemeralTokenGuard(verifier=provider, replay_store=store)
+
+
+def handler(event, context):
+    method_arn = event.get('methodArn', '*')
+    try:
+        guard_request = from_api_gateway(event, context.aws_request_id)
+        result = build_guard().authorize(guard_request)
+        auth_context = result.as_context()
+    except GuardError as exc:
+        print(json.dumps({
+            'event': 'TOKEN_GUARD_DENY',
+            'reason': exc.reason,
+            'methodArn': method_arn,
+        }))
+        return policy('Deny', method_arn, {'reason': exc.reason}, 'unauthorized')
+    except Exception as exc:
+        print(json.dumps({
+            'event': 'TOKEN_GUARD_ERROR',
+            'reason': f'{type(exc).__name__}:{exc}',
+            'methodArn': method_arn,
+        }))
+        return policy('Deny', method_arn, {'reason': 'token_guard_error'}, 'unauthorized')
+
+    print(json.dumps({
+        'event': 'TOKEN_GUARD_ALLOW',
+        'methodArn': method_arn,
+        'session_id': auth_context.get('session_id'),
+        'transaction_id': auth_context.get('transaction_id'),
+        'token_state': auth_context.get('token_state'),
+        'provider_revocation': auth_context.get('provider_revocation'),
+    }))
+    return policy(
+        'Allow',
+        method_arn,
+        auth_context,
+        auth_context.get('merchant_sub') or 'merchant',
+    )

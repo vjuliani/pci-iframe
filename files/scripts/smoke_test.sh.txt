@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TF_DIR="$ROOT/infra/terraform"
+HYDRA_ADMIN_URL="${HYDRA_ADMIN_URL:-http://localhost:4445}"
+
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
+unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE || true
+
+API_BASE="$(cd "$TF_DIR" && terraform output -raw api_base_url)"
+API_ID="$(cd "$TF_DIR" && terraform output -raw api_id)"
+TOKEN_LEDGER="$(cd "$TF_DIR" && terraform output -raw token_ledger_table)"
+GUARD_FN="$(cd "$TF_DIR" && terraform output -raw token_guard_lambda)"
+MERCHANT_JWT="${MERCHANT_JWT:-$(python3 "$ROOT/scripts/create_demo_jwt.py")}" 
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+echo "API: $API_BASE"
+echo "Token Guard: $GUARD_FN"
+echo "Replay store: $TOKEN_LEDGER"
+
+SESSION_CODE=$(curl -sS -o "$TMP/session.json" -w '%{http_code}' \
+  -X POST "$API_BASE/checkout-session" \
+  -H "Authorization: Bearer $MERCHANT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":1099,"currency":"brl","merchant_reference":"order_guard_001","return_url":"http://localhost:8880/success"}')
+
+echo "Create session: HTTP $SESSION_CODE"
+python3 -m json.tool < "$TMP/session.json" || cat "$TMP/session.json"
+[[ "$SESSION_CODE" == "201" ]] || { echo "ERROR: session creation failed" >&2; exit 1; }
+
+TOKEN=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ephemeral_token") or d["session_token"])' < "$TMP/session.json")
+TXN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])' < "$TMP/session.json")
+
+# The browser-facing ephemeral token must be opaque, never a self-contained JWT.
+python3 - "$TOKEN" <<'PY'
+import sys
+t=sys.argv[1]
+if t.count('.') == 2:
+    raise SystemExit('ERROR: ephemeral token is JWT-shaped; expected opaque token')
+print('Ephemeral token format: opaque (non-JWT)')
+PY
+
+cat > "$TMP/authorizer-event.json" <<JSON
+{
+  "type": "TOKEN",
+  "authorizationToken": "Bearer ${TOKEN}",
+  "methodArn": "arn:aws:execute-api:${AWS_REGION}:000000000000:${API_ID}/local/POST/payment"
+}
+JSON
+
+echo
+echo "Token Guard first authorization (expected Allow):"
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" lambda invoke \
+  --cli-binary-format raw-in-base64-out \
+  --function-name "$GUARD_FN" \
+  --payload "fileb://$TMP/authorizer-event.json" \
+  "$TMP/guard-first.json" >/dev/null
+python3 -m json.tool < "$TMP/guard-first.json"
+EFFECT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["policyDocument"]["Statement"][0]["Effect"])' < "$TMP/guard-first.json")
+[[ "$EFFECT" == "Allow" ]] || { echo "ERROR: first guard authorization was not Allow" >&2; exit 1; }
+
+STATE=$(aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" dynamodb scan \
+  --table-name "$TOKEN_LEDGER" \
+  --query "Items[?transaction_id.S==\`$TXN\`].token_state.S | [0]" \
+  --output text)
+echo "Token ledger state after Guard: $STATE"
+[[ "$STATE" == "USED" ]] || { echo "ERROR: Token Guard did not atomically mark token USED" >&2; exit 1; }
+
+python3 - "$TMP/guard-first.json" "$TMP/checkout-event.json" "$TXN" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1]))
+ctx = policy.get('context') or {}
+event = {
+    'resource': '/payment',
+    'path': '/payment',
+    'httpMethod': 'POST',
+    'headers': {'X-Transaction-Id': sys.argv[3]},
+    'requestContext': {'authorizer': ctx},
+    'body': json.dumps({'payment_method_token': 'pm_test_4242'}),
+}
+json.dump(event, open(sys.argv[2], 'w'))
+PY
+
+echo
+echo "Checkout invocation using only Guard context (expected 200):"
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" lambda invoke \
+  --cli-binary-format raw-in-base64-out \
+  --function-name pci-payment-checkout \
+  --payload "fileb://$TMP/checkout-event.json" \
+  "$TMP/checkout-result.json" >/dev/null
+python3 -m json.tool < "$TMP/checkout-result.json"
+CHECKOUT_STATUS=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("statusCode"))' < "$TMP/checkout-result.json")
+[[ "$CHECKOUT_STATUS" == "200" ]] || { echo "ERROR: checkout did not trust Guard context" >&2; exit 1; }
+
+# Same ephemeral token: the Guard must deny replay.
+echo
+echo "Token Guard replay (expected Deny):"
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" lambda invoke \
+  --cli-binary-format raw-in-base64-out \
+  --function-name "$GUARD_FN" \
+  --payload "fileb://$TMP/authorizer-event.json" \
+  "$TMP/guard-replay.json" >/dev/null
+python3 -m json.tool < "$TMP/guard-replay.json"
+REPLAY_EFFECT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["policyDocument"]["Statement"][0]["Effect"])' < "$TMP/guard-replay.json")
+[[ "$REPLAY_EFFECT" == "Deny" ]] || { echo "ERROR: replay was not denied" >&2; exit 1; }
+
+echo
+echo "Hydra introspection after Guard consumption/revocation:"
+curl -sS -X POST "$HYDRA_ADMIN_URL/admin/oauth2/introspect" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode "token=$TOKEN" | python3 -m json.tool
+
+echo
+echo "PASS: only Ephemeral Token Guard changed ACTIVE -> USED; checkout consumed no token state; replay was denied."

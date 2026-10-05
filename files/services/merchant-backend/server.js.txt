@@ -1,0 +1,170 @@
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+
+const PORT = Number(process.env.PORT || 3002);
+const PRIVATE_KEY = fs.readFileSync(process.env.MERCHANT_PRIVATE_KEY_FILE || '/run/secrets/merchant/merchant-private.pem', 'utf8');
+const PUBLIC_KEY = fs.readFileSync(process.env.MERCHANT_PUBLIC_KEY_FILE || '/run/secrets/merchant/merchant-public.pem', 'utf8');
+const JWT_ISSUER = process.env.MERCHANT_JWT_ISSUER || 'merchant-demo';
+const JWT_AUDIENCE = process.env.MERCHANT_JWT_AUDIENCE || 'checkout-session-service';
+const CHECKOUT_SESSION_API_BASE_URL = process.env.CHECKOUT_SESSION_API_BASE_URL || 'http://localstack:4566/local';
+const PAYMENT_PUBLIC_API_BASE_URL = process.env.PAYMENT_PUBLIC_API_BASE_URL || 'http://REPLACE_API_ID.execute-api.localhost.localstack.cloud:4566/local';
+const API_GATEWAY_HOST = process.env.API_GATEWAY_HOST || '';
+const IFRAME_URL = process.env.PCI_IFRAME_URL || 'http://localhost:8881/';
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:8880';
+const DEMO_MODE = String(process.env.DEMO_MODE || 'true') === 'true';
+
+const b64u = b => Buffer.from(b).toString('base64url');
+function sign(payload) {
+  const h = b64u(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: 'merchant-rs256-v1' }));
+  const p = b64u(JSON.stringify(payload));
+  const s = crypto.sign('RSA-SHA256', Buffer.from(`${h}.${p}`), PRIVATE_KEY).toString('base64url');
+  return `${h}.${p}.${s}`;
+}
+function verify(token) {
+  const [h, p, s] = token.split('.');
+  if (!h || !p || !s) throw new Error('malformed_token');
+  const header = JSON.parse(Buffer.from(h, 'base64url').toString());
+  if (header.alg !== 'RS256') throw new Error('unexpected_alg');
+  if (!crypto.verify('RSA-SHA256', Buffer.from(`${h}.${p}`), PUBLIC_KEY, Buffer.from(s, 'base64url'))) throw new Error('invalid_signature');
+  const claims = JSON.parse(Buffer.from(p, 'base64url').toString());
+  const now = Math.floor(Date.now() / 1000);
+  const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (claims.iss !== JWT_ISSUER) throw new Error('invalid_issuer');
+  if (!aud.includes(JWT_AUDIENCE)) throw new Error('invalid_audience');
+  if (!claims.exp || claims.exp <= now) throw new Error('expired');
+  if (claims.nbf && claims.nbf > now + 5) throw new Error('not_yet_valid');
+  if (!String(claims.scope || '').split(/\s+/).includes('checkout.session.create')) throw new Error('insufficient_scope');
+  return claims;
+}
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', FRONTEND_ORIGIN);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Cache-Control', 'no-store');
+}
+function json(res, status, body) {
+  cors(res);
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+async function body(req) {
+  let d = '';
+  for await (const c of req) {
+    d += c;
+    if (d.length > 100000) throw new Error('body_too_large');
+  }
+  return d ? JSON.parse(d) : {};
+}
+async function upstreamJson(url, options = {}) {
+  // Use node:http instead of fetch so the local transport can connect to the
+  // LocalStack container while preserving the canonical execute-api Host header.
+  // This is important because /restapis/.../_user_request_ can bypass parts of
+  // API Gateway emulation, including the Lambda Authorizer pipeline.
+  const target = new URL(url);
+  const payload = options.body == null ? null : Buffer.from(String(options.body));
+  const headers = { ...(options.headers || {}) };
+  if (API_GATEWAY_HOST) headers.Host = API_GATEWAY_HOST;
+  if (payload && headers['content-length'] == null && headers['Content-Length'] == null) {
+    headers['Content-Length'] = String(payload.length);
+  }
+  return await new Promise((resolve, reject) => {
+    const request = http.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || 80,
+      path: `${target.pathname}${target.search}`,
+      method: options.method || 'GET',
+      headers,
+    }, response => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { text += chunk; });
+      response.on('end', () => {
+        let data;
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+        resolve({
+          response: {
+            status: response.statusCode || 500,
+            ok: (response.statusCode || 500) >= 200 && (response.statusCode || 500) < 300,
+          },
+          data,
+        });
+      });
+    });
+    request.setTimeout(10000, () => request.destroy(new Error('upstream_timeout')));
+    request.on('error', reject);
+    if (payload) request.write(payload);
+    request.end();
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') { cors(res); res.writeHead(204); return res.end(); }
+  if (req.method === 'GET' && req.url === '/health') {
+    return json(res, 200, {
+      status: 'ok',
+      checkout_session_api: CHECKOUT_SESSION_API_BASE_URL,
+      payment_public_api: PAYMENT_PUBLIC_API_BASE_URL,
+      api_gateway_host: API_GATEWAY_HOST,
+      ephemeral_token_format: 'opaque',
+    });
+  }
+
+  // Demo helper only: represents the merchant's own authenticated server identity.
+  if (req.method === 'GET' && req.url === '/api/demo/token' && DEMO_MODE) {
+    const now = Math.floor(Date.now() / 1000);
+    return json(res, 200, {
+      token: sign({
+        iss: JWT_ISSUER,
+        sub: 'merchant_test_123',
+        aud: [JWT_AUDIENCE, 'http://hydra:4444/oauth2/token'],
+        iat: now,
+        nbf: now - 1,
+        exp: now + 600,
+        jti: `merchant_jti_${crypto.randomUUID().replaceAll('-', '')}`,
+        scope: 'checkout.session.create payment.execute',
+      }),
+    });
+  }
+
+  // Flow 2: Merchant Frontend -> Merchant Backend -> API Gateway Checkout Session -> Checkout Session.
+  if (req.method === 'POST' && req.url === '/api/checkout/session') {
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) return json(res, 401, { error: 'missing_bearer_token' });
+    const merchantJwt = auth.slice(7).trim();
+    try { verify(merchantJwt); } catch (e) { return json(res, 401, { error: 'invalid_merchant_token', reason: e.message }); }
+
+    let payload;
+    try { payload = await body(req); } catch { return json(res, 400, { error: 'invalid_json' }); }
+    try {
+      const { response, data } = await upstreamJson(`${CHECKOUT_SESSION_API_BASE_URL}/checkout-session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${merchantJwt}` },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) return json(res, response.status, { error: 'create_session_failed', upstream: data });
+      return json(res, 201, {
+        id: data.id,
+        transaction_id: data.transaction_id,
+        ephemeral_token: data.ephemeral_token || data.session_token,
+        // Backward-compatible alias for older UI clients. The value is opaque, not a JWT.
+        client_secret: data.ephemeral_token || data.client_secret || data.session_token,
+        expires_at: data.expires_at,
+        iframe_url: IFRAME_URL,
+        payment_api_url: `${PAYMENT_PUBLIC_API_BASE_URL.replace(/\/$/, '')}/payment`,
+      });
+    } catch (e) {
+      console.error('checkout-session upstream error', e);
+      return json(res, 502, { error: 'checkout_session_api_unavailable' });
+    }
+  }
+
+  // Payment is intentionally NOT proxied by the Merchant Backend.
+  // PCI Hosted Fields submits directly to API Gateway /payment.
+
+  return json(res, 404, { error: 'not_found' });
+});
+
+server.listen(PORT, '0.0.0.0', () => console.log(`merchant-backend listening on ${PORT}`));

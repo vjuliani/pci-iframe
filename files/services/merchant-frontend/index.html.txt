@@ -1,0 +1,40 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Merchant Checkout</title>
+<style>body{font-family:system-ui;margin:0;background:#f5f7fb;color:#172033}.wrap{max-width:760px;margin:50px auto;padding:24px}.card{background:#fff;border:1px solid #dde3ee;border-radius:18px;padding:28px;box-shadow:0 12px 40px #17203314}.methods{display:grid;gap:12px}.method{padding:18px;border:1px solid #ccd5e3;border-radius:14px;cursor:pointer}.method.active{border:2px solid #635bff;background:#f7f6ff}button{background:#635bff;color:white;border:0;padding:14px 18px;border-radius:10px;font-weight:700;cursor:pointer}.muted{color:#67738a;font-size:14px}#secure{margin-top:18px}pre{white-space:pre-wrap}</style></head>
+<body><div class="wrap"><div class="card"><h1>Finalizar pagamento</h1><p class="muted">Os dados sensíveis e o submit do pagamento ficam no iframe PCI. O Merchant Backend participa somente da criação da Checkout Session.</p><div class="methods"><div class="method active">💳 Cartão de crédito</div></div><p><b>Total:</b> R$ 10,99</p><button id="start">Continuar com cartão</button><div id="secure"></div><pre id="status"></pre></div></div>
+<script type="module">
+import {PciCheckout} from '/sdk/pci-checkout.js';
+const BACKEND='http://localhost:3002';
+const status=document.querySelector('#status');
+
+function safeResult(data){
+  if(!data || typeof data!=='object') return data;
+  const copy={...data};
+  delete copy.ephemeral_token;
+  delete copy.client_secret;
+  return copy;
+}
+
+document.querySelector('#start').onclick=async()=>{
+  status.textContent='Criando checkout session via Merchant Backend...';
+  const demo=await fetch(`${BACKEND}/api/demo/token`).then(r=>r.json());
+  const r=await fetch(`${BACKEND}/api/checkout/session`,{
+    method:'POST',
+    headers:{Authorization:`Bearer ${demo.token}`,'Content-Type':'application/json'},
+    body:JSON.stringify({amount:1099,currency:'brl',merchant_reference:`order_${Date.now()}`,return_url:location.origin+'/success'})
+  });
+  const session=await r.json();
+  if(!r.ok){status.textContent=JSON.stringify(session,null,2);return;}
+  status.textContent=`Session ${session.id} criada. O pagamento será enviado diretamente pelo iframe PCI ao API Gateway.`;
+
+  const checkout=new PciCheckout({iframeUrl:session.iframe_url,target:document.querySelector('#secure')}).mount();
+  checkout.configure({
+    sessionId:session.id,
+    transactionId:session.transaction_id,
+    ephemeralToken:session.ephemeral_token || session.client_secret,
+    paymentUrl:session.payment_api_url
+  }).onResult(event=>{
+    if(event.data?.type!=='pci:payment-result') return;
+    status.textContent=JSON.stringify({http_status:event.data.httpStatus,...safeResult(event.data.result)},null,2);
+  });
+};
+</script></body></html>

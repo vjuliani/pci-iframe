@@ -1,0 +1,254 @@
+import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import base64
+from dataclasses import dataclass
+
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
+from security import sha256_hex
+
+
+@dataclass
+class AuthorizationError(Exception):
+    reason: str
+    status_code: int = 403
+
+    def __str__(self):
+        return self.reason
+
+
+def normalize_headers(event):
+    return {
+        str(k).lower(): v
+        for k, v in (event.get('headers') or {}).items()
+        if k is not None
+    }
+
+
+def extract_bearer(headers):
+    value = headers.get('authorization', '')
+    if not value.startswith('Bearer '):
+        raise AuthorizationError('missing_authorization', 401)
+    token = value[7:].strip()
+    if not token:
+        raise AuthorizationError('missing_authorization', 401)
+    return token
+
+
+def request_binding(event):
+    request_context = event.get('requestContext') or {}
+    method = event.get('httpMethod') or request_context.get('httpMethod') or ''
+    route = event.get('resource') or event.get('path') or request_context.get('resourcePath') or ''
+
+    if (not method or not route) and event.get('methodArn'):
+        arn_tail = event['methodArn'].split(':', 5)[-1]
+        parts = arn_tail.split('/')
+        if not method and len(parts) > 2:
+            method = parts[2]
+        if not route and len(parts) > 3:
+            route = '/' + '/'.join(parts[3:])
+    return method, route
+
+
+def extract_authorizer_context(event):
+    authorizer = ((event.get('requestContext') or {}).get('authorizer') or {})
+    if not isinstance(authorizer, dict):
+        return {}
+    if authorizer.get('transaction_id'):
+        return authorizer
+    for key in ('lambda', 'context'):
+        nested = authorizer.get(key)
+        if isinstance(nested, dict) and nested.get('transaction_id'):
+            return nested
+    return {}
+
+
+def _table(table_name, endpoint_url=None):
+    dynamodb = boto3.resource('dynamodb', endpoint_url=endpoint_url)
+    return dynamodb.Table(table_name)
+
+
+def _post_form(url, values, timeout=5):
+    data = urllib.parse.urlencode(values).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method='POST',
+        headers={'content-type': 'application/x-www-form-urlencoded'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode()
+            return resp.status, json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors='replace')
+        raise AuthorizationError(f'hydra_http_{exc.code}:{detail}', 502) from exc
+    except Exception as exc:
+        raise AuthorizationError('hydra_unavailable', 502) from exc
+
+
+def introspect_hydra_token(token, hydra_admin_url):
+    _, result = _post_form(
+        f"{hydra_admin_url.rstrip('/')}/admin/oauth2/introspect",
+        {'token': token},
+    )
+    if not result.get('active'):
+        raise AuthorizationError('inactive_hydra_token', 401)
+    return result
+
+
+def revoke_hydra_token(
+    token,
+    hydra_public_url,
+    hydra_client_id,
+    hydra_client_secret,
+):
+    data = urllib.parse.urlencode({
+        "token": token,
+        "token_type_hint": "access_token",
+    }).encode()
+
+    credentials = f"{hydra_client_id}:{hydra_client_secret}"
+    basic = base64.b64encode(
+        credentials.encode("utf-8")
+    ).decode("ascii")
+
+    req = urllib.request.Request(
+        f"{hydra_public_url.rstrip('/')}/oauth2/revoke",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {basic}",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise AuthorizationError(
+            f"hydra_http_{exc.code}:{detail}",
+            502,
+        ) from exc
+
+    except Exception as exc:
+        raise AuthorizationError(
+            f"hydra_unavailable:{type(exc).__name__}:{exc}",
+            502,
+        ) from exc
+
+
+def _scope_contains(value, required):
+    if isinstance(value, list):
+        return required in value
+    return required in str(value or '').split()
+
+
+def authorize_and_consume(
+    event,
+    aws_request_id,
+    *,
+    table_name,
+    hydra_admin_url,
+    hydra_public_url,
+    hydra_client_id,
+    hydra_client_secret,
+    required_scope='checkout.confirm',
+    endpoint_url=None,
+):
+    headers = normalize_headers(event)
+    token = extract_bearer(headers)
+    transaction_id = headers.get('x-transaction-id', '')
+    if not transaction_id:
+        raise AuthorizationError('missing_transaction_id', 400)
+
+    introspection = introspect_hydra_token(token, hydra_admin_url)
+    if not _scope_contains(introspection.get('scope'), required_scope):
+        raise AuthorizationError('invalid_scope', 403)
+    if introspection.get('client_id') and introspection.get('client_id') != hydra_client_id:
+        raise AuthorizationError('unexpected_hydra_client', 403)
+
+    method, route = request_binding(event)
+    now = int(time.time())
+    token_hash = sha256_hex(token)
+    table = _table(table_name, endpoint_url)
+
+    result = table.query(
+        IndexName='token_hash-index',
+        KeyConditionExpression=Key('token_hash').eq(token_hash),
+        Limit=2,
+    )
+    items = result.get('Items') or []
+    if len(items) != 1:
+        raise AuthorizationError('session_not_found', 403)
+    item = items[0]
+
+    expected_method = item.get('allowed_method', '')
+    expected_route = item.get('allowed_route', '')
+    if expected_method and method and method != expected_method:
+        raise AuthorizationError('method_mismatch', 403)
+    if expected_route and route and route != expected_route:
+        raise AuthorizationError('route_mismatch', 403)
+    if item.get('transaction_id') != transaction_id:
+        raise AuthorizationError('transaction_mismatch', 403)
+    if item.get('hydra_client_id') != hydra_client_id:
+        raise AuthorizationError('hydra_client_binding_mismatch', 403)
+    if item.get('merchant_sub') and introspection.get('sub') and item.get('merchant_sub') != introspection.get('sub'):
+        raise AuthorizationError('subject_mismatch', 403)
+
+    try:
+        updated = table.update_item(
+            Key={'pk': item['pk'], 'sk': item['sk']},
+            UpdateExpression='SET #st = :used, consumed_at = :now, consumed_request_id = :rid',
+            ConditionExpression=(
+                '#st = :active AND expires_at >= :now AND transaction_id = :txn '
+                'AND token_hash = :hash AND allowed_method = :method AND allowed_route = :route'
+            ),
+            ExpressionAttributeNames={'#st': 'status'},
+            ExpressionAttributeValues={
+                ':used': 'USED',
+                ':active': 'ACTIVE',
+                ':now': now,
+                ':rid': aws_request_id,
+                ':txn': transaction_id,
+                ':hash': token_hash,
+                ':method': expected_method,
+                ':route': expected_route,
+            },
+            ReturnValues='ALL_NEW',
+        )
+    except ClientError as exc:
+        code = exc.response.get('Error', {}).get('Code')
+        if code == 'ConditionalCheckFailedException':
+            raise AuthorizationError('expired_or_already_used', 403) from exc
+        raise AuthorizationError('authorization_storage_error', 500) from exc
+
+    attrs = updated.get('Attributes') or item
+
+    # Defense in depth: the DynamoDB transition is the authoritative single-use
+    # control. Revoke the Hydra token as well so introspection becomes inactive.
+    hydra_revocation = 'ok'
+    try:
+        revoke_hydra_token(token, hydra_public_url, hydra_client_id, hydra_client_secret)
+    except AuthorizationError as exc:
+        hydra_revocation = 'failed'
+        print(json.dumps({'event': 'HYDRA_REVOCATION_FAILED', 'reason': exc.reason}))
+
+    return {
+        'session_id': attrs.get('session_id', ''),
+        'transaction_id': transaction_id,
+        'merchant_sub': attrs.get('merchant_sub', ''),
+        'amount': str(attrs.get('amount', '')),
+        'currency': attrs.get('currency', ''),
+        'consumed_request_id': aws_request_id,
+        'hydra_revocation': hydra_revocation,
+    }

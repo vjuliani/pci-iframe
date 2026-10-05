@@ -1,0 +1,249 @@
+import base64
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.append('/opt/python')
+try:
+    from security import decode_unverified, validate_claims, random_id, sha256_hex, JwtError
+except ImportError:
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'common'))
+    from security import decode_unverified, validate_claims, random_id, sha256_hex, JwtError
+
+import boto3
+
+AWS_ENDPOINT_URL = os.getenv('AWS_ENDPOINT_URL')
+dynamodb = boto3.resource('dynamodb', endpoint_url=AWS_ENDPOINT_URL)
+dynamodb_client = boto3.client('dynamodb', endpoint_url=AWS_ENDPOINT_URL)
+SESSION_TABLE = os.environ['SESSION_TABLE']
+TOKEN_LEDGER_TABLE = os.environ['TOKEN_LEDGER_TABLE']
+MERCHANT_ISSUER = os.getenv('MERCHANT_JWT_ISSUER', 'merchant-demo')
+MERCHANT_AUDIENCE = os.getenv('MERCHANT_JWT_AUDIENCE', 'checkout-session-service')
+HYDRA_PUBLIC_URL = os.environ['HYDRA_PUBLIC_URL'].rstrip('/')
+HYDRA_CLIENT_ID = os.environ['HYDRA_CLIENT_ID']
+HYDRA_CLIENT_SECRET = os.environ['HYDRA_CLIENT_SECRET']
+HYDRA_SCOPE = os.getenv('HYDRA_SCOPE', 'payment.execute')
+TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', '120'))
+
+
+def response(status, body):
+    return {
+        'statusCode': status,
+        'headers': {
+            'content-type': 'application/json',
+            'cache-control': 'no-store',
+            'pragma': 'no-cache',
+            'access-control-allow-origin': '*',
+            'access-control-allow-headers': 'Authorization,Content-Type,X-Transaction-Id',
+            'access-control-allow-methods': 'POST,OPTIONS',
+        },
+        'body': json.dumps(body),
+    }
+
+
+def exchange_with_hydra(assertion):
+    form = urllib.parse.urlencode({
+        'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        'assertion': assertion,
+        'scope': HYDRA_SCOPE,
+    }).encode()
+    basic = base64.b64encode(f'{HYDRA_CLIENT_ID}:{HYDRA_CLIENT_SECRET}'.encode()).decode('ascii')
+    req = urllib.request.Request(
+        f'{HYDRA_PUBLIC_URL}/oauth2/token',
+        data=form,
+        method='POST',
+        headers={
+            'content-type': 'application/x-www-form-urlencoded',
+            'authorization': f'Basic {basic}',
+            'accept': 'application/json',
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors='replace')
+        raise RuntimeError(f'hydra_exchange_failed:http:{exc.code}:{detail}') from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'hydra_exchange_failed:network:{type(exc.reason).__name__}:{exc.reason}') from exc
+    except Exception as exc:
+        raise RuntimeError(f'hydra_exchange_failed:{type(exc).__name__}:{exc}') from exc
+
+
+def handler(event, context):
+    headers = {str(k).lower(): v for k, v in (event.get('headers') or {}).items()}
+    auth = headers.get('authorization', '')
+    if not auth.startswith('Bearer '):
+        return response(401, {'error': 'missing_merchant_token'})
+
+    merchant_token = auth[7:].strip()
+    # Preliminary claim checks only. Cryptographic verification is delegated to Hydra
+    # through the RFC 7523 trusted-issuer exchange below.
+    try:
+        header, claims = decode_unverified(merchant_token)
+        if header.get('alg') != 'RS256':
+            raise JwtError('unexpected_alg')
+        validate_claims(claims, issuer=MERCHANT_ISSUER, audience=MERCHANT_AUDIENCE)
+    except JwtError as exc:
+        return response(401, {'error': 'invalid_merchant_token', 'reason': str(exc)})
+    if 'checkout.session.create' not in str(claims.get('scope', '')).split():
+        return response(403, {'error': 'insufficient_merchant_scope'})
+
+    try:
+        body = json.loads(event.get('body') or '{}')
+    except json.JSONDecodeError:
+        return response(400, {'error': 'invalid_json'})
+
+    merchant_reference = body.get('merchant_reference', '')
+    amount = body.get('amount')
+    currency = str(body.get('currency', '')).lower()
+    return_url = body.get('return_url')
+
+    if merchant_reference and (not isinstance(merchant_reference, str) or len(merchant_reference) > 128):
+        return response(400, {'error': 'invalid_merchant_reference'})
+    if not isinstance(amount, int) or amount <= 0:
+        return response(400, {'error': 'invalid_amount'})
+    if len(currency) != 3 or not currency.isalpha():
+        return response(400, {'error': 'invalid_currency'})
+
+    now = int(time.time())
+    session_id = random_id('cs')
+    transaction_id = random_id('txn')
+
+    # The original signed merchant JWT is the RFC 7523 assertion. Hydra validates
+    # its signature/trusted issuer and issues the ephemeral access token.
+    try:
+        hydra = exchange_with_hydra(merchant_token)
+    except RuntimeError as exc:
+        print(json.dumps({
+            'event': 'HYDRA_EXCHANGE_ERROR',
+            'hydra_url': HYDRA_PUBLIC_URL,
+            'error': str(exc),
+        }))
+        body = {'error': 'token_exchange_failed'}
+        if os.getenv('LOCAL_DIAGNOSTICS', 'false').lower() == 'true':
+            body['reason'] = str(exc)
+        return response(502, body)
+
+    try:
+        validate_claims(claims, issuer=MERCHANT_ISSUER, audience=MERCHANT_AUDIENCE)
+    except JwtError as exc:
+        return response(401, {'error': 'invalid_merchant_token', 'reason': str(exc)})
+
+    session_token = hydra.get('access_token', '')
+    token_type = hydra.get('token_type', 'bearer')
+    expires_in = int(hydra.get('expires_in') or TTL_SECONDS)
+    if not session_token:
+        return response(502, {'error': 'hydra_missing_access_token'})
+
+    exp = now + min(expires_in, TTL_SECONDS)
+    token_hash = sha256_hex(session_token)
+
+    session_item = {
+        'pk': f'SESSION#{session_id}',
+        'sk': 'META',
+        'session_id': session_id,
+        'transaction_id': transaction_id,
+        'merchant_sub': claims.get('sub', 'merchant'),
+        'merchant_reference': merchant_reference,
+        'amount': amount,
+        'currency': currency,
+        'return_url': return_url or '',
+        'status': 'OPEN',
+        'created_at': now,
+        'expires_at': exp,
+        'ttl': exp + 300,
+    }
+
+    token_item = {
+        'token_hash': token_hash,
+        'session_id': session_id,
+        'transaction_id': transaction_id,
+        'merchant_sub': claims.get('sub', 'merchant'),
+        'source_jti': claims.get('jti', ''),
+        'source_token_hash': sha256_hex(merchant_token),
+        'hydra_client_id': HYDRA_CLIENT_ID,
+        'hydra_scope': HYDRA_SCOPE,
+        'amount': amount,
+        'currency': currency,
+        'token_state': 'ACTIVE',
+        'created_at': now,
+        'expires_at': exp,
+        'ttl': exp + 300,
+        'allowed_method': 'POST',
+        'allowed_route': '/payment',
+    }
+
+    # Session metadata and the one-time token ledger are registered atomically.
+    # Registration is not token consumption: only the Token Guard may change
+    # token_state from ACTIVE to USED.
+    try:
+        dynamodb_client.transact_write_items(
+            TransactItems=[
+                {
+                    'Put': {
+                        'TableName': SESSION_TABLE,
+                        'Item': {
+                            'pk': {'S': session_item['pk']},
+                            'sk': {'S': session_item['sk']},
+                            'session_id': {'S': session_id},
+                            'transaction_id': {'S': transaction_id},
+                            'merchant_sub': {'S': session_item['merchant_sub']},
+                            'merchant_reference': {'S': merchant_reference},
+                            'amount': {'N': str(amount)},
+                            'currency': {'S': currency},
+                            'return_url': {'S': return_url or ''},
+                            'status': {'S': 'OPEN'},
+                            'created_at': {'N': str(now)},
+                            'expires_at': {'N': str(exp)},
+                            'ttl': {'N': str(exp + 300)},
+                        },
+                        'ConditionExpression': 'attribute_not_exists(pk)',
+                    }
+                },
+                {
+                    'Put': {
+                        'TableName': TOKEN_LEDGER_TABLE,
+                        'Item': {
+                            'token_hash': {'S': token_hash},
+                            'session_id': {'S': session_id},
+                            'transaction_id': {'S': transaction_id},
+                            'merchant_sub': {'S': token_item['merchant_sub']},
+                            'source_jti': {'S': token_item['source_jti']},
+                            'source_token_hash': {'S': token_item['source_token_hash']},
+                            'hydra_client_id': {'S': HYDRA_CLIENT_ID},
+                            'hydra_scope': {'S': HYDRA_SCOPE},
+                            'amount': {'N': str(amount)},
+                            'currency': {'S': currency},
+                            'token_state': {'S': 'ACTIVE'},
+                            'created_at': {'N': str(now)},
+                            'expires_at': {'N': str(exp)},
+                            'ttl': {'N': str(exp + 300)},
+                            'allowed_method': {'S': 'POST'},
+                            'allowed_route': {'S': '/payment'},
+                        },
+                        'ConditionExpression': 'attribute_not_exists(token_hash)',
+                    }
+                },
+            ]
+        )
+    except Exception as exc:
+        print(json.dumps({'event': 'SESSION_PERSISTENCE_ERROR', 'error': type(exc).__name__}))
+        return response(500, {'error': 'session_persistence_failed'})
+
+    return response(201, {
+        'id': session_id,
+        'transaction_id': transaction_id,
+        'ephemeral_token': session_token,
+        'session_token': session_token,  # compatibility alias
+        'token_type': token_type,
+        'expires_at': exp,
+        'client_secret': session_token,  # compatibility alias; opaque value
+        'issued_by': 'ory-hydra',
+        'token_format': 'opaque',
+        'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    })

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TF_DIR="$ROOT/infra/terraform"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
+unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE || true
+
+API_ID="$(cd "$TF_DIR" && terraform output -raw api_id)"
+GUARD_FN="$(cd "$TF_DIR" && terraform output -raw token_guard_lambda)"
+PAYMENT_ID="$(aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" apigateway get-resources \
+  --rest-api-id "$API_ID" --query "items[?path=='/payment'].id | [0]" --output text)"
+
+[[ -n "$PAYMENT_ID" && "$PAYMENT_ID" != "None" ]] || { echo 'ERROR: /payment resource not found' >&2; exit 1; }
+
+echo "API ID:           $API_ID"
+echo "Payment resource: $PAYMENT_ID"
+echo "Token Guard:      $GUARD_FN"
+
+echo
+echo 'POST /payment:'
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" apigateway get-method \
+  --rest-api-id "$API_ID" --resource-id "$PAYMENT_ID" --http-method POST \
+  --query '{authorizationType:authorizationType,authorizerId:authorizerId,requestParameters:requestParameters}'
+
+echo
+echo 'Authorizer:'
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" apigateway get-authorizers \
+  --rest-api-id "$API_ID" \
+  --query 'items[].{id:id,name:name,type:type,identitySource:identitySource,ttl:authorizerResultTtlInSeconds,uri:authorizerUri}'
+
+echo
+echo 'Token Guard Lambda policy:'
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" lambda get-policy \
+  --function-name "$GUARD_FN" --query Policy --output text | python3 -m json.tool
+
+echo
+echo 'Stage:'
+STAGE_DEPLOYMENT="$(aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" apigateway get-stage \
+  --rest-api-id "$API_ID" --stage-name local --query deploymentId --output text)"
+echo "stage local deploymentId: $STAGE_DEPLOYMENT"
+
+echo
+echo 'Terraform deployment:'
+TF_DEPLOYMENT="$(cd "$TF_DIR" && terraform state show -no-color aws_api_gateway_deployment.checkout 2>/dev/null | awk -F' = ' '/^[[:space:]]*id[[:space:]]*=/{gsub(/\"/,"",$2); print $2; exit}')"
+echo "terraform deployment id:  ${TF_DEPLOYMENT:-unknown}"
+if [[ -n "${TF_DEPLOYMENT:-}" && "$TF_DEPLOYMENT" != "$STAGE_DEPLOYMENT" ]]; then
+  echo 'ERROR: Terraform deployment and stage deployment differ.' >&2
+  exit 1
+fi
+
+echo
+echo 'Lambda status:'
+aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" lambda get-function \
+  --function-name "$GUARD_FN" --query 'Configuration.{name:FunctionName,state:State,lastUpdate:LastUpdateStatus}'
+
+echo
+echo 'PASS: static API Gateway -> TOKEN Authorizer wiring is coherent.'

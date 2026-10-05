@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+API_ID="$(cd "$ROOT/infra/terraform" && terraform output -raw api_id)"
+API_HOST="${API_ID}.execute-api.localhost.localstack.cloud:4566"
+API_BASE="http://${API_HOST}/local"
+INTERNAL="http://localstack:4566/local"
+LOCAL_AUTH_MODE="${LOCAL_AUTH_MODE:-adapter}"
+
+case "$LOCAL_AUTH_MODE" in
+  adapter)
+    PAYMENT_PUBLIC="http://localhost:8890"
+    ;;
+  apigateway)
+    PAYMENT_PUBLIC="$API_BASE"
+    ;;
+  *)
+    echo "ERROR: LOCAL_AUTH_MODE must be 'adapter' or 'apigateway'" >&2
+    exit 2
+    ;;
+esac
+
+cat > "$ROOT/.demo.env" <<ENV
+LOCAL_AUTH_MODE=${LOCAL_AUTH_MODE}
+CHECKOUT_SESSION_INTERNAL_API_BASE_URL=${INTERNAL}
+PAYMENT_PUBLIC_API_BASE_URL=${PAYMENT_PUBLIC}
+API_GATEWAY_HOST=${API_HOST}
+ENV
+
+echo "Local auth mode:               ${LOCAL_AUTH_MODE}"
+echo "Checkout Session API:          ${API_BASE}/checkout-session"
+echo "Payment URL exposed to iframe: ${PAYMENT_PUBLIC}/payment"
+echo "Canonical Payment API:         ${API_BASE}/payment"
+echo "Ephemeral access token:        opaque"
+if [[ "$LOCAL_AUTH_MODE" == "adapter" ]]; then
+  echo "Local demo path: PCI iframe -> Local Token Guard Adapter -> same Guard core -> Payment Checkout"
+else
+  echo "Compatibility path: PCI iframe -> API Gateway -> TOKEN Authorizer -> Payment Checkout"
+fi

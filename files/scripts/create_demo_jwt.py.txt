@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import subprocess
+import tempfile
+import time
+import uuid
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+def b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+p = argparse.ArgumentParser()
+p.add_argument('--sub', default='merchant_test_123')
+p.add_argument('--ttl', type=int, default=900)
+p.add_argument('--private-key', default=os.getenv('MERCHANT_PRIVATE_KEY', os.path.join(ROOT, 'secrets', 'merchant-private.pem')))
+p.add_argument('--hydra-aud', default=os.getenv('HYDRA_ASSERTION_AUDIENCE', 'http://hydra:4444/oauth2/token'))
+a = p.parse_args()
+if not os.path.exists(a.private_key):
+    raise SystemExit(f"Private key not found: {a.private_key}. Run ./scripts/generate_merchant_keys.sh")
+now = int(time.time())
+header = {'alg': 'RS256', 'typ': 'JWT', 'kid': 'merchant-rs256-v1'}
+claims = {
+    'iss': 'merchant-demo',
+    'aud': ['checkout-session-service', a.hydra_aud],
+    'sub': a.sub,
+    'jti': f'merchant_jti_{uuid.uuid4().hex}',
+    'scope': 'checkout.session.create payment.execute',
+    'iat': now,
+    'nbf': now - 1,
+    'exp': now + a.ttl,
+}
+signing_input = f"{b64u(json.dumps(header,separators=(',',':'),sort_keys=True).encode())}.{b64u(json.dumps(claims,separators=(',',':'),sort_keys=True).encode())}"
+proc = subprocess.run(
+    ['openssl', 'dgst', '-sha256', '-sign', a.private_key],
+    input=signing_input.encode('ascii'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+)
+print(f"{signing_input}.{b64u(proc.stdout)}")

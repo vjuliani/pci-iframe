@@ -1,0 +1,69 @@
+import time
+
+import boto3
+from botocore.exceptions import ClientError
+
+from token_guard.errors import GuardError
+
+
+class DynamoDbReplayStore:
+    """AWS adapter implementing the replay-store port with an atomic consume."""
+
+    def __init__(self, *, table_name, endpoint_url=None):
+        self.table = boto3.resource('dynamodb', endpoint_url=endpoint_url).Table(table_name)
+
+    def consume(self, *, token_hash, request, verified):
+        now = int(time.time())
+        result = self.table.get_item(
+            Key={'token_hash': token_hash},
+            ConsistentRead=True,
+        )
+        item = result.get('Item')
+        if not item:
+            raise GuardError('token_ledger_entry_not_found', 403)
+
+        # REQUEST adapters can bind a transaction header here. TOKEN authorizers
+        # intentionally recover the trusted transaction id from this ledger entry;
+        # Payment Checkout later compares it with X-Transaction-Id on the request.
+        if request.transaction_id and item.get('transaction_id') != request.transaction_id:
+            raise GuardError('transaction_mismatch', 403)
+        if item.get('allowed_method') and request.method != item.get('allowed_method'):
+            raise GuardError('method_mismatch', 403)
+        if item.get('allowed_route') and request.route != item.get('allowed_route'):
+            raise GuardError('route_mismatch', 403)
+        if item.get('hydra_client_id') and verified.client_id != item.get('hydra_client_id'):
+            raise GuardError('hydra_client_binding_mismatch', 403)
+        if item.get('merchant_sub') and verified.subject != item.get('merchant_sub'):
+            raise GuardError('subject_mismatch', 403)
+
+        try:
+            updated = self.table.update_item(
+                Key={'token_hash': token_hash},
+                UpdateExpression=(
+                    'SET #state = :used, consumed_at = :now, '
+                    'consumed_request_id = :rid'
+                ),
+                ConditionExpression=(
+                    '#state = :active AND expires_at >= :now '
+                    'AND transaction_id = :txn '
+                    'AND allowed_method = :method AND allowed_route = :route'
+                ),
+                ExpressionAttributeNames={'#state': 'token_state'},
+                ExpressionAttributeValues={
+                    ':used': 'USED',
+                    ':active': 'ACTIVE',
+                    ':now': now,
+                    ':rid': request.request_id,
+                    ':txn': request.transaction_id or item.get('transaction_id'),
+                    ':method': request.method,
+                    ':route': request.route,
+                },
+                ReturnValues='ALL_NEW',
+            )
+        except ClientError as exc:
+            code = exc.response.get('Error', {}).get('Code')
+            if code == 'ConditionalCheckFailedException':
+                raise GuardError('expired_or_already_used', 403) from exc
+            raise GuardError('replay_store_error', 500) from exc
+
+        return updated.get('Attributes') or item

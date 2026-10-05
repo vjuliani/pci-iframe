@@ -1,0 +1,42 @@
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: pci-checkout-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=lambda,apigateway,dynamodb,iam,logs,sts
+      - DEBUG=${DEBUG:-0}
+      - PERSISTENCE=1
+      - LAMBDA_KEEPALIVE_MS=600000
+      - LOCALSTACK_AUTH_TOKEN=ls-fUgulOda-leWu-7161-keBO-2124TIZi9b92
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - pci-checkout
+
+  hydra:
+    image: oryd/hydra:v2.3.0
+    container_name: pci-checkout-hydra
+    command: serve all --dev
+    ports:
+      - "4444:4444"
+      - "4445:4445"
+    environment:
+      - DSN=memory
+      - URLS_SELF_ISSUER=http://hydra:4444/
+      - SECRETS_SYSTEM=dev-hydra-system-secret-change-me-32bytes-minimum
+      - STRATEGIES_ACCESS_TOKEN=jwt
+      - TTL_ACCESS_TOKEN=2m
+      - OAUTH2_EXPOSE_INTERNAL_ERRORS=true
+      - LOG_LEVEL=debug
+    networks:
+      - pci-checkout
+
+volumes:
+  localstack-data:
+
+networks:
+  pci-checkout:
+    name: pci-checkout-net

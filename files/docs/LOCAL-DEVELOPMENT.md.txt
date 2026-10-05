@@ -1,0 +1,15 @@
+# Local development authorization modes
+
+## `adapter` (default demo mode)
+
+The PCI iframe submits `POST /payment` to `http://localhost:8890`. The local adapter runs the same `EphemeralTokenGuard` core used by the Lambda Authorizer, consumes the opaque token atomically in DynamoDB, revokes it in Hydra as defense-in-depth, then invokes `pci-payment-checkout` with trusted authorizer context.
+
+The adapter never forwards the bearer token to Payment Checkout.
+
+## `apigateway` (compatibility mode)
+
+The PCI iframe submits directly to the canonical LocalStack execute-api URL. The intended path is API Gateway -> TOKEN Lambda Authorizer -> Payment Checkout. LocalStack 2026.9.0 may skip the Authorizer while still invoking the integration; Payment Checkout fails closed with `authorization_context_missing`.
+
+## Production
+
+Do not deploy the local adapter. Use API Gateway + Lambda Authorizer. Restrict PCI iframe CSP `connect-src` to the exact payment API origin.

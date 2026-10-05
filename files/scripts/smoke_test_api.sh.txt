@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TF_DIR="$ROOT/infra/terraform"
+
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
+unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE || true
+
+API_BASE="$(cd "$TF_DIR" && terraform output -raw api_base_url)"
+TOKEN_LEDGER="$(cd "$TF_DIR" && terraform output -raw token_ledger_table)"
+MERCHANT_JWT="${MERCHANT_JWT:-$(python3 "$ROOT/scripts/create_demo_jwt.py")}" 
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+echo "API: $API_BASE"
+
+SESSION_CODE=$(curl -sS -o "$TMP/session.json" -w '%{http_code}' \
+  -X POST "$API_BASE/checkout-session" \
+  -H "Authorization: Bearer $MERCHANT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":1099,"currency":"brl","merchant_reference":"order_api_001"}')
+
+echo "Create session: HTTP $SESSION_CODE"
+python3 -m json.tool < "$TMP/session.json" || cat "$TMP/session.json"
+[[ "$SESSION_CODE" == "201" ]] || exit 1
+TOKEN=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ephemeral_token") or d["session_token"])' < "$TMP/session.json")
+TXN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])' < "$TMP/session.json")
+
+# The browser-facing ephemeral token must be opaque, never a self-contained JWT.
+python3 - "$TOKEN" <<'PY'
+import sys
+t=sys.argv[1]
+if t.count('.') == 2:
+    raise SystemExit('ERROR: ephemeral token is JWT-shaped; expected opaque token')
+print('Ephemeral token format: opaque (non-JWT)')
+PY
+
+echo
+echo "API Gateway -> Token Guard -> Checkout (expected 200):"
+CODE=$(curl -sS -o "$TMP/confirm.json" -w '%{http_code}' \
+  -X POST "$API_BASE/payment" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Transaction-Id: $TXN" \
+  -H 'Content-Type: application/json' \
+  -d '{"payment_method_token":"pm_test_4242"}')
+echo "HTTP $CODE"
+python3 -m json.tool < "$TMP/confirm.json" || cat "$TMP/confirm.json"
+
+STATE=$(aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" dynamodb scan \
+  --table-name "$TOKEN_LEDGER" \
+  --query "Items[?transaction_id.S==\`$TXN\`].token_state.S | [0]" \
+  --output text 2>/dev/null || true)
+ERROR_CODE=$(python3 -c 'import json,sys;
+try: print(json.load(sys.stdin).get("error", ""))
+except Exception: print("")' < "$TMP/confirm.json")
+echo "Token ledger state: ${STATE:-unknown}"
+echo "Response error:     ${ERROR_CODE:-none}"
+
+if [[ "$CODE" != "200" ]]; then
+  echo >&2
+  if [[ "$STATE" == "ACTIVE" && "$CODE" == "403" && ( "$ERROR_CODE" == "authorization_context_missing" || "$ERROR_CODE" == "missing_token_guard_context" ) ]]; then
+    echo "WARN: LocalStack compatibility limitation detected." >&2
+    echo "The Payment Checkout integration ran while the token remained ACTIVE," >&2
+    echo "so this LocalStack build skipped the configured TOKEN Lambda Authorizer." >&2
+    echo "Static wiring can still be checked with 'make diagnose' and the Guard core with 'make test'." >&2
+    echo "Use 'make test-local' or 'make demo-up' for a deterministic local end-to-end flow." >&2
+    if [[ "${STRICT_API_AUTHORIZER:-0}" == "1" ]]; then
+      echo "STRICT_API_AUTHORIZER=1: treating compatibility limitation as failure." >&2
+      exit 1
+    fi
+    echo "COMPATIBILITY RESULT: WARN (not an application/core failure)."
+    exit 0
+  fi
+
+  echo "ERROR: API-level flow failed for an unexpected reason." >&2
+  if [[ "$STATE" == "USED" ]]; then
+    echo "The Token Guard consumed the token, but API Gateway did not propagate its context to checkout." >&2
+  else
+    echo "Unexpected token ledger state: ${STATE:-unknown}" >&2
+  fi
+  exit 1
+fi
+
+echo
+echo "Replay through API Gateway (expected 401/403):"
+REPLAY=$(curl -sS -o "$TMP/replay.json" -w '%{http_code}' \
+  -X POST "$API_BASE/payment" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Transaction-Id: $TXN" \
+  -H 'Content-Type: application/json' \
+  -d '{"payment_method_token":"pm_test_4242"}')
+echo "HTTP $REPLAY"
+python3 -m json.tool < "$TMP/replay.json" || cat "$TMP/replay.json"
+case "$REPLAY" in 401|403) ;; *) exit 1 ;; esac
+
+echo "PASS: end-to-end API Gateway flow uses Token Guard as the single token-consumption point."

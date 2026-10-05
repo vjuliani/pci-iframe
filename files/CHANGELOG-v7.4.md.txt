@@ -1,0 +1,28 @@
+# v7.4 — Authorizer wiring cleanup and deterministic deployment
+
+## Correções
+
+- Mantém o fluxo único de pagamento: PCI Hosted Fields -> API Gateway `/payment` -> TOKEN Lambda Authorizer -> Ephemeral Token Guard -> Payment Checkout.
+- Remove a permissão duplicada `allow_apigateway_authorizer`, cuja `source_arn` podia ser gerada com account ID vazio no LocalStack.
+- Mantém uma única permissão do API Gateway para invocar `pci-ephemeral-token-guard`, sem `source_arn` no ambiente local.
+- O provider AWS volta a resolver o account ID via STS; assim os ARNs de execução das demais permissões recebem `000000000000` no LocalStack.
+- O deployment do REST API depende explicitamente das permissões Lambda, Authorizer, métodos, integrações e CORS antes de criar o snapshot.
+- O smoke test direto foi corrigido de evento REQUEST para evento TOKEN, igual ao Authorizer real.
+- Adicionado `make diagnose` para verificar `/payment`, Authorizer, policy da Lambda, stage/deployment e estado da função.
+- Removidos artefatos legados: HTTP Guard Proxy, runtime-config antigo, tfstate, zips de build, caches Python e chaves RSA geradas.
+- O token efêmero continua opaco, curto e single-use; somente o Token Guard executa `ACTIVE -> USED`.
+
+## Fluxo de pagamento
+
+```text
+PCI Hosted Fields
+  -> API Gateway POST /payment
+  -> TOKEN Lambda Authorizer
+  -> Ephemeral Token Guard
+       -> Ory Hydra introspection
+       -> DynamoDB ACTIVE -> USED
+       -> ALLOW + trusted context
+  -> Payment Checkout
+```
+
+O Merchant Backend participa apenas da criação da Checkout Session e nunca recebe PAN/CVC nem processa `/payment`.

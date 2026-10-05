@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Merchant Checkout Demo</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 16px">
+<h1>Merchant Checkout Demo</h1>
+<p>Create a session from your backend in production. For this local POC, paste the demo merchant JWT below.</p>
+<label>API base URL <input id="api" size="70" placeholder="http://...execute-api.localhost.localstack.cloud:4566" /></label><br><br>
+<label>Merchant JWT <textarea id="jwt" rows="5" cols="80"></textarea></label><br><br>
+<button id="start">Create checkout</button>
+<pre id="out"></pre>
+<div id="checkout"></div>
+<script type="module">
+import { PciCheckout } from '../sdk/pci-checkout.js';
+const out = document.getElementById('out');
+document.getElementById('start').onclick = async () => {
+  const apiBaseUrl = document.getElementById('api').value.trim();
+  const merchantJwt = document.getElementById('jwt').value.trim();
+  const checkout = new PciCheckout({
+    apiBaseUrl,
+    pciFrameUrl: 'http://localhost:8881/index.html',
+    allowedFrameOrigin: 'http://localhost:8881',
+  });
+  try {
+    const session = await checkout.createSession({ merchantJwt, amount: 1099, currency: 'brl', returnUrl: location.href, merchantReference: `order_${crypto.randomUUID()}` });
+    out.textContent = JSON.stringify({ id: session.id, transaction_id: session.transaction_id, expires_at: session.expires_at }, null, 2);
+    checkout.mount({
+      element: document.getElementById('checkout'),
+      session,
+      onSuccess: (x) => out.textContent += '\nSUCCESS\n' + JSON.stringify(x, null, 2),
+      onError: (x) => out.textContent += '\nERROR\n' + JSON.stringify(x, null, 2),
+    });
+  } catch (e) { out.textContent = String(e); }
+};
+</script>
+</body>
+</html>

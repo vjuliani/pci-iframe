@@ -1,0 +1,65 @@
+from token_guard.errors import GuardError
+from token_guard.models import GuardRequest
+
+
+def normalize_headers(event):
+    return {
+        str(k).lower(): v
+        for k, v in (event.get('headers') or {}).items()
+        if k is not None
+    }
+
+
+def strip_bearer(value):
+    value = str(value or '').strip()
+    if value.lower().startswith('bearer '):
+        value = value[7:].strip()
+    if not value:
+        raise GuardError('missing_authorization', 401)
+    return value
+
+
+def request_binding(event):
+    request_context = event.get('requestContext') or {}
+    method = event.get('httpMethod') or request_context.get('httpMethod') or ''
+    route = event.get('resource') or event.get('path') or request_context.get('resourcePath') or ''
+
+    if (not method or not route) and event.get('methodArn'):
+        arn_tail = event['methodArn'].split(':', 5)[-1]
+        parts = arn_tail.split('/')
+        if not method and len(parts) > 2:
+            method = parts[2]
+        if not route and len(parts) > 3:
+            route = '/' + '/'.join(parts[3:])
+    return method, route
+
+
+def from_api_gateway(event, lambda_request_id):
+    """Translate either REST TOKEN or REQUEST authorizer events into the portable guard model.
+
+    v7.3 uses TOKEN authorizers by default because the opaque token is the authorization
+    identity. The transaction id is deliberately not trusted from the authorizer event;
+    it is recovered from the token ledger after the token is verified/consumed, and the
+    Payment Checkout compares that trusted context with X-Transaction-Id from the request.
+    REQUEST events remain supported for portability/testing.
+    """
+    event_type = str(event.get('type') or '').upper()
+    headers = normalize_headers(event)
+
+    if event_type == 'TOKEN' or event.get('authorizationToken'):
+        token = strip_bearer(event.get('authorizationToken'))
+        transaction_id = ''
+    else:
+        token = strip_bearer(headers.get('authorization', ''))
+        transaction_id = str(headers.get('x-transaction-id') or '')
+
+    method, route = request_binding(event)
+    request_context = event.get('requestContext') or {}
+    request_id = str(request_context.get('requestId') or lambda_request_id)
+    return GuardRequest(
+        token=token,
+        transaction_id=transaction_id,
+        method=method,
+        route=route,
+        request_id=request_id,
+    )

@@ -1,0 +1,27 @@
+# v7.5 — Local Token Guard Adapter
+
+## Goal
+
+Preserve the production architecture while making the local UI demonstrable when LocalStack skips the REST API TOKEN Lambda Authorizer.
+
+## Production / AWS path
+
+`PCI Hosted Fields -> API Gateway /payment -> TOKEN Lambda Authorizer -> Ephemeral Token Guard -> Payment Checkout`
+
+## Local deterministic path
+
+`PCI Hosted Fields -> Local Token Guard Adapter -> same EphemeralTokenGuard core -> Payment Checkout Lambda`
+
+The adapter is infrastructure-only. It does not implement a second consume algorithm; the only `ACTIVE -> USED` transition remains `EphemeralTokenGuard -> ReplayStore.consume()`.
+
+## New commands
+
+- `make demo-up`: local adapter mode (recommended for UI/demo)
+- `make test-local`: deterministic local end-to-end test
+- `make demo-up-api`: LocalStack API Gateway Authorizer compatibility mode
+- `make test-api`: reports known LocalStack skip as WARN
+- `make test-api-strict`: fails if the LocalStack Authorizer is skipped
+
+## Error handling
+
+Payment Checkout remains fail-closed. Missing authorizer context now returns `authorization_context_missing` with a clear message.

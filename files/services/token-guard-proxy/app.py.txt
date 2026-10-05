@@ -1,0 +1,146 @@
+import json
+import os
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import boto3
+
+from token_guard.core import EphemeralTokenGuard
+from token_guard.errors import GuardError
+from token_guard.models import GuardRequest
+from token_guard.providers.hydra import HydraTokenProvider
+from token_guard.stores.dynamodb import DynamoDbReplayStore
+
+PORT = int(os.getenv('PORT', '8890'))
+TOKEN_LEDGER_TABLE = os.environ['TOKEN_LEDGER_TABLE']
+AWS_ENDPOINT_URL = os.environ['AWS_ENDPOINT_URL']
+AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
+HYDRA_ADMIN_URL = os.environ['HYDRA_ADMIN_URL']
+HYDRA_PUBLIC_URL = os.environ['HYDRA_PUBLIC_URL']
+HYDRA_CLIENT_ID = os.environ['HYDRA_CLIENT_ID']
+HYDRA_CLIENT_SECRET = os.environ['HYDRA_CLIENT_SECRET']
+HYDRA_SCOPE = os.getenv('HYDRA_SCOPE', 'payment.execute')
+CHECKOUT_FUNCTION_NAME = os.getenv('CHECKOUT_FUNCTION_NAME', 'pci-payment-checkout')
+CORS_ORIGIN = os.getenv('CORS_ORIGIN', 'http://localhost:8881')
+
+
+def build_guard():
+    return EphemeralTokenGuard(
+        verifier=HydraTokenProvider(
+            admin_url=HYDRA_ADMIN_URL,
+            public_url=HYDRA_PUBLIC_URL,
+            client_id=HYDRA_CLIENT_ID,
+            client_secret=HYDRA_CLIENT_SECRET,
+            required_scope=HYDRA_SCOPE,
+        ),
+        replay_store=DynamoDbReplayStore(
+            table_name=TOKEN_LEDGER_TABLE,
+            endpoint_url=AWS_ENDPOINT_URL,
+        ),
+    )
+
+
+def bearer(value):
+    if not value or not value.startswith('Bearer '):
+        raise GuardError('missing_authorization', 401)
+    token = value[7:].strip()
+    if not token:
+        raise GuardError('missing_authorization', 401)
+    return token
+
+
+def invoke_checkout(auth_context, transaction_id, raw_body):
+    # The downstream receives no bearer token and cannot consume token state.
+    event = {
+        'resource': '/payment',
+        'path': '/payment',
+        'httpMethod': 'POST',
+        'headers': {
+            'X-Transaction-Id': transaction_id,
+            'Content-Type': 'application/json',
+        },
+        'requestContext': {
+            'authorizer': auth_context,
+            'requestId': auth_context.get('consumed_request_id'),
+        },
+        'body': raw_body,
+        'isBase64Encoded': False,
+    }
+    client = boto3.client('lambda', region_name=AWS_REGION, endpoint_url=AWS_ENDPOINT_URL)
+    response = client.invoke(
+        FunctionName=CHECKOUT_FUNCTION_NAME,
+        InvocationType='RequestResponse',
+        Payload=json.dumps(event).encode(),
+    )
+    payload = json.loads(response['Payload'].read().decode() or '{}')
+    if response.get('FunctionError'):
+        raise RuntimeError(f"checkout_lambda_error:{payload}")
+    return payload
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'EphemeralTokenGuardProxy/7.0'
+
+    def _headers(self, status, content_type='application/json'):
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Access-Control-Allow-Origin', CORS_ORIGIN)
+        self.send_header('Vary', 'Origin')
+        self.send_header('Access-Control-Allow-Headers', 'Authorization,Content-Type,X-Transaction-Id')
+        self.send_header('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        self.end_headers()
+
+    def _json(self, status, body):
+        self._headers(status)
+        self.wfile.write(json.dumps(body).encode())
+
+    def do_OPTIONS(self):
+        self._headers(204)
+
+    def do_GET(self):
+        if self.path == '/health':
+            return self._json(200, {'status': 'ok', 'adapter': 'http-guard-proxy'})
+        return self._json(404, {'error': 'not_found'})
+
+    def do_POST(self):
+        if self.path != '/payment':
+            return self._json(404, {'error': 'not_found'})
+        try:
+            token = bearer(self.headers.get('Authorization'))
+            transaction_id = self.headers.get('X-Transaction-Id', '').strip()
+            if not transaction_id:
+                raise GuardError('missing_transaction_id', 400)
+            length = int(self.headers.get('Content-Length', '0') or 0)
+            if length > 100_000:
+                return self._json(413, {'error': 'body_too_large'})
+            raw_body = self.rfile.read(length).decode() if length else '{}'
+            request_id = f'http_{uuid.uuid4().hex}'
+            result = build_guard().authorize(GuardRequest(
+                token=token,
+                transaction_id=transaction_id,
+                method='POST',
+                route='/payment',
+                request_id=request_id,
+            ))
+            upstream = invoke_checkout(result.as_context(), transaction_id, raw_body)
+            status = int(upstream.get('statusCode', 502))
+            body = upstream.get('body', '{}')
+            try:
+                body = json.loads(body)
+            except Exception:
+                body = {'raw': body}
+            return self._json(status, body)
+        except GuardError as exc:
+            return self._json(exc.status_code, {'error': exc.reason})
+        except Exception as exc:
+            print(json.dumps({'event': 'HTTP_GUARD_PROXY_ERROR', 'reason': f'{type(exc).__name__}:{exc}'}), flush=True)
+            return self._json(502, {'error': 'guard_proxy_error'})
+
+    def log_message(self, fmt, *args):
+        print(json.dumps({'event': 'HTTP', 'message': fmt % args}), flush=True)
+
+
+if __name__ == '__main__':
+    print(json.dumps({'event': 'HTTP_GUARD_PROXY_STARTED', 'port': PORT}), flush=True)
+    ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()

@@ -1,0 +1,2 @@
+window.CHECKOUT_API_BASE_URL = 'http://nv1fp4f0di.execute-api.localhost.localstack.cloud:4566/local';
+window.CHECKOUT_CONFIRM_URL = 'http://localhost:8890/checkout/confirm';

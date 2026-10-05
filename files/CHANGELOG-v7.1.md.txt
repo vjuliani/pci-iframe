@@ -1,0 +1,13 @@
+# v7.1 — API Gateway owns payment authorization
+
+## Architectural correction
+
+The canonical payment route is now enforced in every default environment configuration:
+
+`Merchant Backend -> API Gateway POST /payment -> Lambda Authorizer (Ephemeral Token Guard) -> Payment Checkout`
+
+The Merchant Backend never calls the Token Guard directly. The API Gateway `/payment` method is configured with `authorization = CUSTOM` and `authorizer_id = ephemeral-token-guard`; the Payment Checkout Lambda remains the integration target and is invoked only after an `Allow` policy is returned.
+
+## Local development
+
+`configure_demo.sh` now points both Checkout Session and Payment traffic at the LocalStack API Gateway. The HTTP Token Guard Proxy remains in the repository only as an optional `local-proxy` profile for diagnosing LocalStack versions that do not execute REST REQUEST Authorizers correctly; it is not started by `demo-up` and is not part of the canonical architecture.

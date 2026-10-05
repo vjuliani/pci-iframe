@@ -1,0 +1,78 @@
+.PHONY: keys up hydra-init init deploy diagnose test test-api test-api-strict test-local down reset fresh ui clean-tf logs demo-build demo-up demo-up-api
+
+keys:
+	./scripts/generate_merchant_keys.sh
+
+up: keys
+	docker compose up -d hydra-postgres hydra-migrate hydra localstack
+	./scripts/init_hydra.sh
+
+hydra-init: keys
+	./scripts/init_hydra.sh
+
+init:
+	cd infra/terraform && terraform init -upgrade
+
+deploy: init
+	cd infra/terraform && terraform apply -auto-approve
+
+diagnose:
+	./scripts/diagnose_gateway.sh
+
+test: keys
+	./scripts/smoke_test.sh
+
+# Compatibility test for LocalStack API Gateway -> TOKEN Authorizer.
+# A known LocalStack emulation miss is reported as WARN instead of generic failure.
+test-api: keys
+	./scripts/smoke_test_api.sh
+
+# Same API-level test, but fail if LocalStack skips the Authorizer.
+test-api-strict: keys
+	STRICT_API_AUTHORIZER=1 ./scripts/smoke_test_api.sh
+
+# Deterministic local end-to-end demo using the same Token Guard core.
+test-local: keys
+	LOCAL_AUTH_MODE=adapter ./scripts/configure_demo.sh
+	docker compose --profile local-adapter --env-file .demo.env up -d --build token-guard-adapter
+	./scripts/smoke_test_adapter.sh
+
+ui: demo-up
+	@echo "UI started through Docker Compose."
+
+logs:
+	docker compose --profile local-adapter logs -f localstack hydra hydra-postgres merchant-backend token-guard-adapter
+
+clean-tf:
+	rm -rf infra/terraform/.terraform infra/terraform/.terraform.lock.hcl infra/terraform/*.tfstate infra/terraform/*.tfstate.* infra/terraform/*.zip
+
+down:
+	docker compose --profile local-adapter down
+
+reset:
+	docker compose --profile local-adapter down -v
+	rm -rf infra/terraform/.terraform infra/terraform/.terraform.lock.hcl infra/terraform/*.tfstate infra/terraform/*.tfstate.* infra/terraform/*.zip
+
+fresh: reset up deploy diagnose
+
+# Local UI demo defaults to the adapter because LocalStack 2026.9.0 may skip REST TOKEN Authorizers.
+demo-build: keys
+	LOCAL_AUTH_MODE=adapter ./scripts/configure_demo.sh
+	docker compose --profile local-adapter --env-file .demo.env build merchant-backend merchant-frontend pci-hosted-fields token-guard-adapter
+
+demo-up: demo-build
+	docker compose --profile local-adapter --env-file .demo.env up -d --force-recreate merchant-backend merchant-frontend pci-hosted-fields token-guard-adapter
+	@echo "Merchant frontend:   http://localhost:8880"
+	@echo "PCI iframe:          http://localhost:8881"
+	@echo "Merchant backend:    http://localhost:3002 (checkout-session only)"
+	@echo "Local Guard Adapter: http://localhost:8890 (development only)"
+	@echo "Auth mode:           adapter"
+
+# Explicit compatibility mode: iframe calls LocalStack API Gateway /payment directly.
+demo-up-api: keys
+	LOCAL_AUTH_MODE=apigateway ./scripts/configure_demo.sh
+	docker compose --env-file .demo.env build merchant-backend merchant-frontend pci-hosted-fields
+	docker compose --env-file .demo.env up -d --force-recreate merchant-backend merchant-frontend pci-hosted-fields
+	@echo "Merchant frontend: http://localhost:8880"
+	@echo "PCI iframe:        http://localhost:8881"
+	@echo "Auth mode:         apigateway (LocalStack compatibility test)"

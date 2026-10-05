@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TF_DIR="$ROOT/infra/terraform"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_DEFAULT_REGION="$AWS_REGION"
+unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE || true
+
+API_BASE="$(cd "$TF_DIR" && terraform output -raw api_base_url)"
+TOKEN_LEDGER="$(cd "$TF_DIR" && terraform output -raw token_ledger_table)"
+MERCHANT_JWT="${MERCHANT_JWT:-$(python3 "$ROOT/scripts/create_demo_jwt.py")}" 
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+echo "Session API:       $API_BASE"
+echo "Local Guard Adapter: http://localhost:8890"
+
+for _ in $(seq 1 30); do
+  if curl -fsS http://localhost:8890/health > "$TMP/health.json" 2>/dev/null; then break; fi
+  sleep 1
+done
+curl -fsS http://localhost:8890/health | python3 -m json.tool
+
+SESSION_CODE=$(curl -sS -o "$TMP/session.json" -w '%{http_code}' \
+  -X POST "$API_BASE/checkout-session" \
+  -H "Authorization: Bearer $MERCHANT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":1099,"currency":"brl","merchant_reference":"order_adapter_001"}')
+[[ "$SESSION_CODE" == "201" ]] || { cat "$TMP/session.json"; exit 1; }
+TOKEN=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ephemeral_token") or d["session_token"])' < "$TMP/session.json")
+TXN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])' < "$TMP/session.json")
+
+echo
+echo "Local adapter -> Guard core -> Payment Checkout (expected 200):"
+CODE=$(curl -sS -o "$TMP/payment.json" -w '%{http_code}' \
+  -X POST http://localhost:8890/payment \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Transaction-Id: $TXN" \
+  -H 'Content-Type: application/json' \
+  -d '{"payment_method_token":"pm_test_4242"}')
+echo "HTTP $CODE"; python3 -m json.tool < "$TMP/payment.json" || cat "$TMP/payment.json"
+[[ "$CODE" == "200" ]] || exit 1
+
+STATE=$(aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" dynamodb scan \
+  --table-name "$TOKEN_LEDGER" \
+  --query "Items[?transaction_id.S==\`$TXN\`].token_state.S | [0]" --output text)
+echo "Token ledger state: $STATE"
+[[ "$STATE" == "USED" ]] || exit 1
+
+echo
+echo "Replay through local adapter (expected 401/403):"
+REPLAY=$(curl -sS -o "$TMP/replay.json" -w '%{http_code}' \
+  -X POST http://localhost:8890/payment \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Transaction-Id: $TXN" \
+  -H 'Content-Type: application/json' \
+  -d '{"payment_method_token":"pm_test_4242"}')
+echo "HTTP $REPLAY"; python3 -m json.tool < "$TMP/replay.json" || cat "$TMP/replay.json"
+case "$REPLAY" in 401|403) ;; *) exit 1 ;; esac
+
+echo "PASS: local adapter used the same Ephemeral Token Guard as the single consumption point."

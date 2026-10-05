@@ -1,0 +1,32 @@
+# Payment authorization — API Gateway TOKEN Lambda Authorizer
+
+`POST /payment` is protected by an API Gateway **TOKEN** Lambda Authorizer.
+
+```text
+PCI Hosted Fields
+    |
+    | Authorization: Bearer <opaque token>
+    | X-Transaction-Id: txn_...
+    | payment_method_token
+    v
+API Gateway /payment
+    |
+    +--> TOKEN Lambda Authorizer / Ephemeral Token Guard
+    |       +--> Ory Hydra introspection
+    |       +--> DynamoDB token ledger ACTIVE -> USED
+    |       +--> ALLOW + trusted context(transaction_id,...)
+    |
+    v
+Payment Checkout
+    +--> compare request X-Transaction-Id with trusted authorizer context
+    +--> process payment
+```
+
+Why TOKEN instead of REQUEST in v7.3:
+
+- the opaque access token is the authorization identity;
+- Token Guard resolves the trusted `transaction_id` from the token ledger;
+- Payment Checkout still requires `X-Transaction-Id` and compares it to the authorizer context;
+- this keeps transaction binding while simplifying API Gateway authorizer execution, including local emulation.
+
+The Merchant Backend has no `/api/payment` proxy in v7.3.

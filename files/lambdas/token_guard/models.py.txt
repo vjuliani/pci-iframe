@@ -1,0 +1,44 @@
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+
+@dataclass(frozen=True)
+class GuardRequest:
+    token: str
+    transaction_id: str
+    method: str
+    route: str
+    request_id: str
+
+
+@dataclass(frozen=True)
+class VerifiedToken:
+    active: bool
+    subject: str
+    client_id: str
+    scopes: List[str] = field(default_factory=list)
+    claims: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AuthorizationResult:
+    session_id: str
+    transaction_id: str
+    merchant_sub: str
+    amount: str
+    currency: str
+    consumed_request_id: str
+    token_state: str
+    provider_revocation: str = "not-attempted"
+
+    def as_context(self):
+        return {
+            "session_id": self.session_id,
+            "transaction_id": self.transaction_id,
+            "merchant_sub": self.merchant_sub,
+            "amount": self.amount,
+            "currency": self.currency,
+            "consumed_request_id": self.consumed_request_id,
+            "token_state": self.token_state,
+            "provider_revocation": self.provider_revocation,
+        }

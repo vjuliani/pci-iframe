@@ -1,0 +1,42 @@
+# Security notes — v6
+
+## Trust chain
+
+1. Merchant Backend signs the merchant assertion with RS256.
+2. Hydra validates that assertion using the configured trusted public JWK.
+3. Hydra issues a short-lived access token for `payment.execute`.
+4. The Session Service stores only the token SHA-256 in the replay ledger, initially `ACTIVE`.
+5. API Gateway calls Ephemeral Token Guard.
+6. Guard introspects the Hydra token, validates request bindings, and performs the only `ACTIVE -> USED` transition.
+7. Guard returns a minimal authorization context to the checkout Lambda.
+8. Checkout never introspects/revokes/consumes the ephemeral token and has no DynamoDB token-store permissions.
+
+## Replay control
+
+`pci-ephemeral-token-ledger` is authoritative. The DynamoDB `UpdateItem` has a condition requiring:
+
+- `token_state = ACTIVE`
+- `expires_at >= now`
+- matching `transaction_id`
+- matching HTTP method and route
+
+Concurrent/replayed calls lose the conditional update and are denied.
+
+## Hydra revocation
+
+After successful ledger consumption, Guard calls `/oauth2/revoke` using `client_secret_basic`. A revocation failure is logged but does not roll back `USED`; otherwise a provider outage could reopen a consumed capability.
+
+## Authorizer cache
+
+API Gateway authorizer TTL is `0`. Caching an Allow policy would violate single-use semantics.
+
+## PCI boundary
+
+PAN/CVC remain inside the separate-origin hosted-fields iframe. The merchant page/backend only sees a payment-method token and the checkout capability token.
+
+
+## Opaque ephemeral token (v7.2)
+
+The merchant identity assertion is a signed RS256 JWT, but the resulting Hydra access token used by the payment flow is opaque. The Token Guard therefore never trusts claims embedded in the bearer value: it introspects Hydra, verifies scope/client/subject, binds the request to the ledger entry and atomically changes `ACTIVE` to `USED`.
+
+`Payment Checkout` receives only trusted authorizer context and has no permission to introspect Hydra or update the token ledger.

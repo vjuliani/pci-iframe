@@ -1,0 +1,10 @@
+from dataclasses import dataclass
+
+
+@dataclass
+class GuardError(Exception):
+    reason: str
+    status_code: int = 403
+
+    def __str__(self):
+        return self.reason

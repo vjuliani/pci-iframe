@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY services/token-guard-adapter/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY services/token-guard-adapter/app.py ./app.py
+COPY lambdas/common/security.py ./security.py
+COPY lambdas/token_guard ./token_guard
+EXPOSE 8890
+CMD ["python", "app.py"]

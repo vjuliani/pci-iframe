@@ -1,0 +1,14 @@
+# v7 changes
+
+- Canonical Checkout Session endpoint changed to `POST /checkout-session`.
+- Canonical Payment endpoint changed to `POST /payment`.
+- Merchant Frontend no longer calls API Gateway or Token Guard proxy directly.
+- PCI Hosted Fields no longer calls any network API; CSP now uses `connect-src 'none'`.
+- PCI iframe creates only a mock `payment_method_token` and returns it via `postMessage`.
+- Merchant Backend now exposes `/api/checkout/session` and `/api/payment` and is the only platform integration point for the browser.
+- Ephemeral token scope changed from `checkout.confirm` to `payment.execute`.
+- Token ledger binding changed to `POST /payment`.
+- Payment Lambda renamed to `pci-payment-checkout`.
+- Token Guard remains the only component that performs `ACTIVE -> USED`.
+- LocalStack workaround is hidden behind the Merchant Backend: session uses LocalStack API Gateway, payment uses the HTTP Guard adapter only in local demo mode.
+- Removed legacy `frontend/` direct-call implementation and made `make ui` use the Docker demo.

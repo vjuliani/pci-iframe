@@ -1,0 +1,13 @@
+# v7.3 — Direct PCI payment + TOKEN Authorizer
+
+- PCI Hosted Fields now submits payment directly to API Gateway `/payment`.
+- Merchant Backend is removed from the payment path and only creates Checkout Sessions.
+- `/payment` remains protected by Lambda Authorizer / Ephemeral Token Guard.
+- API Gateway authorizer changed from REQUEST to TOKEN.
+- Opaque token remains the authorization identity.
+- Token Guard recovers trusted transaction id from the token ledger.
+- Payment Checkout compares `X-Transaction-Id` with trusted authorizer context.
+- Ory Hydra continues issuing opaque access tokens via RFC 7523 JWT Bearer Grant.
+- DynamoDB remains the authoritative one-time ledger (`ACTIVE -> USED`).
+- LocalStack API Gateway provider override removed; current provider is used.
+- Legacy HTTP Guard proxy removed from this POC to keep one canonical payment path.

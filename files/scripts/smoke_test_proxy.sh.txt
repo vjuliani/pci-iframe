@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TF_DIR="$ROOT/infra/terraform"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
+unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE || true
+API_BASE="$(cd "$TF_DIR" && terraform output -raw api_base_url)"
+TOKEN_LEDGER="$(cd "$TF_DIR" && terraform output -raw token_ledger_table)"
+MERCHANT_JWT="${MERCHANT_JWT:-$(python3 "$ROOT/scripts/create_demo_jwt.py")}" 
+PROXY="${TOKEN_GUARD_PROXY_URL:-http://localhost:8890}"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+echo "Session API: $API_BASE"
+echo "Token Guard proxy: $PROXY"
+for i in $(seq 1 30); do
+  if curl -fsS "$PROXY/health" > "$TMP/health.json" 2>/dev/null; then break; fi
+  sleep 1
+done
+[[ -s "$TMP/health.json" ]] || { echo "ERROR: Token Guard proxy did not become ready" >&2; exit 1; }
+python3 -m json.tool < "$TMP/health.json"
+SESSION_CODE=$(curl -sS -o "$TMP/session.json" -w '%{http_code}' -X POST "$API_BASE/checkout-session" -H "Authorization: Bearer $MERCHANT_JWT" -H 'Content-Type: application/json' -d '{"amount":1099,"currency":"brl","merchant_reference":"order_proxy_001"}')
+echo "Create session: HTTP $SESSION_CODE"
+python3 -m json.tool < "$TMP/session.json"
+[[ "$SESSION_CODE" == "201" ]] || exit 1
+TOKEN=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ephemeral_token") or d["session_token"])' < "$TMP/session.json")
+TXN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])' < "$TMP/session.json")
+
+echo; echo "HTTP Guard Proxy -> Guard Core -> Payment Checkout (expected 200):"
+CODE=$(curl -sS -o "$TMP/confirm.json" -w '%{http_code}' -X POST "$PROXY/payment" -H "Authorization: Bearer $TOKEN" -H "X-Transaction-Id: $TXN" -H 'Content-Type: application/json' -d '{"payment_method_token":"pm_test_4242"}')
+echo "HTTP $CODE"; python3 -m json.tool < "$TMP/confirm.json"
+[[ "$CODE" == "200" ]] || exit 1
+STATE=$(aws --endpoint-url=http://localhost:4566 --region "$AWS_REGION" dynamodb scan --table-name "$TOKEN_LEDGER" --query "Items[?transaction_id.S==\`$TXN\`].token_state.S | [0]" --output text)
+echo "Token ledger state: $STATE"; [[ "$STATE" == "USED" ]] || exit 1
+
+echo; echo "Replay through HTTP Guard Proxy (expected 401/403):"
+REPLAY=$(curl -sS -o "$TMP/replay.json" -w '%{http_code}' -X POST "$PROXY/payment" -H "Authorization: Bearer $TOKEN" -H "X-Transaction-Id: $TXN" -H 'Content-Type: application/json' -d '{"payment_method_token":"pm_test_4242"}')
+echo "HTTP $REPLAY"; python3 -m json.tool < "$TMP/replay.json"
+case "$REPLAY" in 401|403) ;; *) exit 1 ;; esac
+echo "PASS: HTTP Guard Proxy is the only token-consumption point; checkout has no replay-store access."

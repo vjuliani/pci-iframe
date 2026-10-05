@@ -1,0 +1,78 @@
+import base64
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from token_guard.errors import GuardError
+from token_guard.models import VerifiedToken
+
+
+class HydraTokenProvider:
+    """Hydra adapter. The core only depends on the TokenVerifier port."""
+
+    def __init__(self, *, admin_url, public_url, client_id, client_secret, required_scope):
+        self.admin_url = admin_url.rstrip('/')
+        self.public_url = public_url.rstrip('/')
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.required_scope = required_scope
+
+    @staticmethod
+    def _scope_list(value):
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return str(value or '').split()
+
+    @staticmethod
+    def _post_form(url, values, headers=None, timeout=5):
+        data = urllib.parse.urlencode(values).encode()
+        request_headers = {'content-type': 'application/x-www-form-urlencoded'}
+        request_headers.update(headers or {})
+        req = urllib.request.Request(url, data=data, method='POST', headers=request_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode()
+                return resp.status, json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors='replace')
+            raise GuardError(f'hydra_http_{exc.code}:{detail}', 502) from exc
+        except Exception as exc:
+            raise GuardError(f'hydra_unavailable:{type(exc).__name__}', 502) from exc
+
+    def verify(self, token):
+        _, result = self._post_form(
+            f'{self.admin_url}/admin/oauth2/introspect',
+            {'token': token},
+        )
+        if not result.get('active'):
+            raise GuardError('inactive_hydra_token', 401)
+
+        scopes = self._scope_list(result.get('scope'))
+        if self.required_scope not in scopes:
+            raise GuardError('invalid_scope', 403)
+        if result.get('client_id') and result.get('client_id') != self.client_id:
+            raise GuardError('unexpected_hydra_client', 403)
+
+        return VerifiedToken(
+            active=True,
+            subject=str(result.get('sub') or ''),
+            client_id=str(result.get('client_id') or ''),
+            scopes=scopes,
+            claims=result,
+        )
+
+    def revoke(self, token):
+        # Hydra client is configured for client_secret_basic, so revocation must
+        # authenticate the client using HTTP Basic as well.
+        credentials = base64.b64encode(
+            f'{self.client_id}:{self.client_secret}'.encode('utf-8')
+        ).decode('ascii')
+        self._post_form(
+            f'{self.public_url}/oauth2/revoke',
+            {'token': token, 'token_type_hint': 'access_token'},
+            headers={
+                'authorization': f'Basic {credentials}',
+                'accept': 'application/json',
+            },
+        )

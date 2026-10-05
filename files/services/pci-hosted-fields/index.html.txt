@@ -1,0 +1,60 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Secure Card Fields</title>
+<style>body{font-family:system-ui;margin:0;padding:20px;background:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{font-size:12px;font-weight:700;color:#46536b}input{box-sizing:border-box;width:100%;padding:13px;border:1px solid #cbd5e1;border-radius:9px;font-size:16px}button{width:100%;background:#635bff;color:#fff;border:0;padding:14px;border-radius:9px;font-weight:700;margin-top:14px}.lock{font-size:12px;color:#64748b;margin-bottom:12px}#msg{font-size:12px;margin-top:10px;white-space:pre-wrap}</style></head><body>
+<div class="lock">🔒 Secure PCI iframe — PAN/CVC e submit do pagamento permanecem neste domínio</div><div class="grid"><div class="full"><label>Número do cartão</label><input id="pan" autocomplete="cc-number" inputmode="numeric" value="4242424242424242"></div><div><label>Validade</label><input id="exp" autocomplete="cc-exp" value="12/30"></div><div><label>CVC</label><input id="cvc" autocomplete="cc-csc" value="123"></div><div class="full"><label>Nome</label><input id="name" autocomplete="cc-name" value="Test User"></div></div><button id="pay" disabled>Pagar</button><div id="msg"></div>
+<script>
+let cfg=null;
+const parentOrigin='http://localhost:8880';
+const msg=document.querySelector('#msg');
+
+window.addEventListener('message',e=>{
+  if(e.origin!==parentOrigin || e.data?.type!=='pci:init') return;
+  const paymentUrl=String(e.data.paymentUrl||'');
+  if(!paymentUrl.startsWith('http://') && !paymentUrl.startsWith('https://')) return;
+  cfg={
+    sessionId:String(e.data.sessionId||''),
+    transactionId:String(e.data.transactionId||''),
+    ephemeralToken:String(e.data.ephemeralToken||''),
+    paymentUrl
+  };
+  document.querySelector('#pay').disabled=!(cfg.transactionId && cfg.ephemeralToken);
+});
+
+document.querySelector('#pay').onclick=async()=>{
+  if(!cfg)return;
+  const button=document.querySelector('#pay');
+  button.disabled=true;
+  msg.textContent='Tokenizando e enviando pagamento pela camada de autorização...';
+  const pan=document.querySelector('#pan').value.replace(/\s/g,'');
+
+  // POC only: simula tokenização dentro do domínio PCI. PAN/CVC nunca são
+  // enviados ao merchant nem ao API Gateway; somente o payment_method_token.
+  const paymentMethodToken=`pm_mock_${pan.slice(-4)}_${crypto.randomUUID().slice(0,8)}`;
+
+  let httpStatus=0, result={};
+  try {
+    const response=await fetch(cfg.paymentUrl,{
+      method:'POST',
+      headers:{
+        'Authorization':`Bearer ${cfg.ephemeralToken}`,
+        'X-Transaction-Id':cfg.transactionId,
+        'Content-Type':'application/json'
+      },
+      body:JSON.stringify({payment_method_token:paymentMethodToken})
+    });
+    httpStatus=response.status;
+    try { result=await response.json(); } catch { result={error:'invalid_gateway_response'}; }
+  } catch (error) {
+    result={error:'payment_gateway_unreachable',reason:String(error?.message||error)};
+  }
+
+  if(httpStatus===200){
+    msg.textContent='Pagamento processado.';
+  }else if(httpStatus===403 && result?.error==='authorization_context_missing'){
+    msg.textContent='Pagamento não processado: o ambiente local não executou a camada de autorização.';
+  }else{
+    msg.textContent=`Pagamento retornou HTTP ${httpStatus||'network-error'}.`;
+  }
+  window.parent.postMessage({type:'pci:payment-result',httpStatus,result},parentOrigin);
+  button.disabled=false;
+};
+</script></body></html>

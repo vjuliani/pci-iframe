@@ -1,0 +1,66 @@
+export class PciCheckout {
+  constructor({ apiBaseUrl, pciFrameUrl, allowedFrameOrigin }) {
+    this.apiBaseUrl = apiBaseUrl.replace(/\/$/, '');
+    this.pciFrameUrl = pciFrameUrl;
+    this.allowedFrameOrigin = allowedFrameOrigin || new URL(pciFrameUrl).origin;
+  }
+
+  async createSession({ merchantJwt, amount, currency, returnUrl, merchantReference }) {
+    const res = await fetch(`${this.apiBaseUrl}/checkout/sessions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${merchantJwt}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        merchant_reference: merchantReference || '',
+        amount,
+        currency,
+        return_url: returnUrl,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `create_session_failed_${res.status}`);
+    return data;
+  }
+
+  mount({ element, session, onSuccess, onError }) {
+    if (!element) throw new Error('element_required');
+    const iframe = document.createElement('iframe');
+    const frameUrl = new URL(this.pciFrameUrl);
+    frameUrl.searchParams.set('parent_origin', window.location.origin);
+    iframe.src = frameUrl.toString();
+    iframe.title = 'Secure payment form';
+    iframe.setAttribute('allow', 'payment');
+    iframe.setAttribute('sandbox', 'allow-scripts allow-forms');
+    iframe.style.width = '100%';
+    iframe.style.minHeight = '280px';
+    iframe.style.border = '0';
+    element.replaceChildren(iframe);
+
+    const listener = (evt) => {
+      if (evt.origin !== this.allowedFrameOrigin || evt.source !== iframe.contentWindow) return;
+      if (evt.data?.type === 'pci-frame-ready') {
+        iframe.contentWindow.postMessage({
+          type: 'pci-session-init',
+          payload: {
+            apiBaseUrl: this.apiBaseUrl,
+            sessionToken: session.session_token,
+            sessionId: session.id,
+            transactionId: session.transaction_id,
+          },
+        }, this.allowedFrameOrigin);
+      }
+      if (evt.data?.type === 'pci-checkout-success') onSuccess?.(evt.data.payload);
+      if (evt.data?.type === 'pci-checkout-error') onError?.(evt.data.payload);
+    };
+    window.addEventListener('message', listener);
+
+    return {
+      destroy() {
+        window.removeEventListener('message', listener);
+        iframe.remove();
+      },
+    };
+  }
+}

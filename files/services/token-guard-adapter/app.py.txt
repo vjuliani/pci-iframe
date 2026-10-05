@@ -1,0 +1,175 @@
+import json
+import os
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import boto3
+
+from token_guard.core import EphemeralTokenGuard
+from token_guard.errors import GuardError
+from token_guard.models import GuardRequest
+from token_guard.providers.hydra import HydraTokenProvider
+from token_guard.stores.dynamodb import DynamoDbReplayStore
+
+PORT = int(os.getenv('PORT', '8890'))
+AWS_ENDPOINT_URL = os.getenv('AWS_ENDPOINT_URL', 'http://localstack:4566')
+AWS_REGION = os.getenv('AWS_REGION') or os.getenv('AWS_DEFAULT_REGION') or 'us-east-1'
+TOKEN_LEDGER_TABLE = os.getenv('TOKEN_LEDGER_TABLE', 'pci-ephemeral-token-ledger')
+HYDRA_ADMIN_URL = os.getenv('HYDRA_ADMIN_URL', 'http://hydra:4445')
+HYDRA_PUBLIC_URL = os.getenv('HYDRA_PUBLIC_URL', 'http://hydra:4444')
+HYDRA_CLIENT_ID = os.getenv('HYDRA_CLIENT_ID', 'pci-checkout-exchange')
+HYDRA_CLIENT_SECRET = os.getenv('HYDRA_CLIENT_SECRET', 'dev-pci-checkout-hydra-secret-please-change-32bytes')
+HYDRA_SCOPE = os.getenv('HYDRA_SCOPE', 'payment.execute')
+CHECKOUT_LAMBDA_NAME = os.getenv('CHECKOUT_LAMBDA_NAME', 'pci-payment-checkout')
+ALLOWED_ORIGIN = os.getenv('ALLOWED_ORIGIN', 'http://localhost:8881')
+
+
+def build_guard():
+    return EphemeralTokenGuard(
+        verifier=HydraTokenProvider(
+            admin_url=HYDRA_ADMIN_URL,
+            public_url=HYDRA_PUBLIC_URL,
+            client_id=HYDRA_CLIENT_ID,
+            client_secret=HYDRA_CLIENT_SECRET,
+            required_scope=HYDRA_SCOPE,
+        ),
+        replay_store=DynamoDbReplayStore(
+            table_name=TOKEN_LEDGER_TABLE,
+            endpoint_url=AWS_ENDPOINT_URL,
+        ),
+    )
+
+
+def bearer(headers):
+    value = str(headers.get('Authorization') or '').strip()
+    if not value.lower().startswith('bearer '):
+        raise GuardError('missing_authorization', 401)
+    token = value[7:].strip()
+    if not token:
+        raise GuardError('missing_authorization', 401)
+    return token
+
+
+def invoke_checkout(body_text, transaction_id, auth_context):
+    client = boto3.client(
+        'lambda',
+        endpoint_url=AWS_ENDPOINT_URL,
+        region_name=AWS_REGION,
+    )
+    event = {
+        'httpMethod': 'POST',
+        'path': '/payment',
+        'resource': '/payment',
+        'headers': {
+            'X-Transaction-Id': transaction_id,
+            # Deliberately omit Authorization: checkout must never receive token material.
+        },
+        'requestContext': {
+            'authorizer': auth_context,
+            'requestId': f'local-adapter-{uuid.uuid4()}',
+        },
+        'body': body_text,
+        'isBase64Encoded': False,
+    }
+    result = client.invoke(
+        FunctionName=CHECKOUT_LAMBDA_NAME,
+        InvocationType='RequestResponse',
+        Payload=json.dumps(event).encode('utf-8'),
+    )
+    raw = result['Payload'].read().decode('utf-8')
+    if result.get('FunctionError'):
+        raise RuntimeError(f'checkout_lambda_error:{raw}')
+    return json.loads(raw or '{}')
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'EphemeralTokenGuardLocalAdapter/1.0'
+
+    def log_message(self, fmt, *args):
+        print(json.dumps({'event': 'HTTP', 'message': fmt % args}))
+
+    def cors(self):
+        self.send_header('Access-Control-Allow-Origin', ALLOWED_ORIGIN)
+        self.send_header('Vary', 'Origin')
+        self.send_header('Access-Control-Allow-Headers', 'Authorization,Content-Type,X-Transaction-Id')
+        self.send_header('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Pragma', 'no-cache')
+
+    def respond(self, status, body, extra_headers=None):
+        payload = json.dumps(body).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.cors()
+        for k, v in (extra_headers or {}).items():
+            lk = str(k).lower()
+            if lk not in {'content-length', 'connection', 'access-control-allow-origin'}:
+                self.send_header(k, str(v))
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.cors()
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == '/health':
+            return self.respond(200, {
+                'status': 'ok',
+                'adapter': 'local-token-guard',
+                'single_use_owner': 'EphemeralTokenGuard',
+            })
+        return self.respond(404, {'error': 'not_found'})
+
+    def do_POST(self):
+        if self.path != '/payment':
+            return self.respond(404, {'error': 'not_found'})
+
+        request_id = f'local-adapter-{uuid.uuid4()}'
+        try:
+            token = bearer(self.headers)
+            transaction_id = str(self.headers.get('X-Transaction-Id') or '').strip()
+            if not transaction_id:
+                return self.respond(400, {'error': 'missing_transaction_id'})
+
+            length = int(self.headers.get('Content-Length') or '0')
+            body_text = self.rfile.read(length).decode('utf-8') if length else '{}'
+
+            guard_request = GuardRequest(
+                token=token,
+                transaction_id=transaction_id,
+                method='POST',
+                route='/payment',
+                request_id=request_id,
+            )
+            result = build_guard().authorize(guard_request)
+            auth_context = {k: str(v) for k, v in result.as_context().items() if v is not None}
+
+            print(json.dumps({
+                'event': 'LOCAL_TOKEN_GUARD_ALLOW',
+                'transaction_id': auth_context.get('transaction_id'),
+                'session_id': auth_context.get('session_id'),
+                'token_state': auth_context.get('token_state'),
+            }))
+
+            checkout = invoke_checkout(body_text, transaction_id, auth_context)
+            status = int(checkout.get('statusCode', 502))
+            try:
+                response_body = json.loads(checkout.get('body') or '{}')
+            except Exception:
+                response_body = {'raw': checkout.get('body')}
+            return self.respond(status, response_body, checkout.get('headers') or {})
+
+        except GuardError as exc:
+            print(json.dumps({'event': 'LOCAL_TOKEN_GUARD_DENY', 'reason': exc.reason, 'request_id': request_id}))
+            return self.respond(exc.status_code, {'error': exc.reason})
+        except Exception as exc:
+            print(json.dumps({'event': 'LOCAL_TOKEN_GUARD_ADAPTER_ERROR', 'reason': f'{type(exc).__name__}:{exc}', 'request_id': request_id}))
+            return self.respond(502, {'error': 'local_token_guard_adapter_error'})
+
+
+if __name__ == '__main__':
+    print(json.dumps({'event': 'LOCAL_TOKEN_GUARD_ADAPTER_STARTED', 'port': PORT}))
+    ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()

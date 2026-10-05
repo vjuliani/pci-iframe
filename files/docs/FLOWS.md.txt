@@ -1,0 +1,34 @@
+# Canonical flows — v7.3
+
+## Flow 1 — Payment
+
+`Merchant Frontend -> PCI Hosted Fields -> API Gateway /payment -> TOKEN Lambda Authorizer / Ephemeral Token Guard -> Payment Checkout`
+
+1. Merchant Frontend receives a checkout session from its own backend and initializes the PCI iframe.
+2. The iframe receives only the session identifiers, opaque ephemeral token and public `/payment` URL needed for the payment attempt.
+3. PAN/CVC remain inside the PCI iframe. The POC simulates PSP tokenization and creates `payment_method_token`.
+4. **PCI Hosted Fields submits directly to API Gateway `/payment`** with:
+   - `Authorization: Bearer <opaque ephemeral token>`
+   - `X-Transaction-Id: <transaction id>`
+   - `{ "payment_method_token": "pm_..." }`
+5. API Gateway invokes the TOKEN Lambda Authorizer (`Ephemeral Token Guard`) before the payment integration.
+6. Token Guard introspects the opaque token in Ory Hydra, verifies scope/client/subject, atomically changes the token ledger from `ACTIVE` to `USED`, and returns trusted authorizer context.
+7. Only after `ALLOW` does API Gateway invoke `Payment Checkout`.
+8. Payment Checkout verifies `X-Transaction-Id` against the transaction id injected by Token Guard and processes the payment.
+
+The payment request **never traverses Merchant Backend**.
+
+## Flow 2 — Checkout Session / ephemeral token issuance
+
+`Merchant Frontend -> Merchant Backend -> API Gateway /checkout-session -> Checkout Session -> Ory Hydra`
+
+1. Merchant Frontend asks Merchant Backend to create the session.
+2. Merchant Backend authenticates its own caller and uses its RS256 merchant JWT server-to-server.
+3. Checkout Session sends that JWT to Hydra using RFC 7523 JWT Bearer Grant.
+4. Hydra validates the registered public JWK and issues a short-lived **opaque** access token with scope `payment.execute`.
+5. Checkout Session atomically creates session metadata and the token ledger entry (`ACTIVE`).
+6. Merchant Backend returns session metadata, opaque ephemeral token, PCI iframe URL, and the public payment API URL to Merchant Frontend.
+
+## Single-use authority
+
+Only `EphemeralTokenGuard` performs `ACTIVE -> USED`. Payment Checkout never introspects Hydra and never writes token state.

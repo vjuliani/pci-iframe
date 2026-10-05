@@ -1,0 +1,19 @@
+# v7.2 — Opaque Ephemeral Token + API Gateway pipeline fix
+
+## Security
+- Ory Hydra access token strategy changed from JWT to `opaque`.
+- The merchant RS256 JWT remains only the RFC 7523 assertion used server-to-server to obtain the ephemeral token.
+- The ephemeral token exposed to the merchant flow is opaque and contains no readable claims.
+- Hydra introspection remains the source of truth for token activity, subject, client and scope.
+- DynamoDB remains the authoritative single-use ledger; only Ephemeral Token Guard changes `ACTIVE -> USED`.
+
+## Payment flow
+`Merchant Backend -> API Gateway /payment -> REQUEST Lambda Authorizer -> Ephemeral Token Guard -> ALLOW -> Payment Checkout`.
+
+The Payment Checkout never introspects or consumes an ephemeral token.
+
+## LocalStack correction
+The merchant backend no longer calls the legacy `restapis/{id}/{stage}/_user_request_` URL. It connects to `localstack:4566` while preserving the canonical execute-api `Host` header, so the request goes through the API Gateway request pipeline. `PROVIDER_OVERRIDE_APIGATEWAY=next_gen` is explicit in Compose.
+
+## Compatibility
+`session_token` and `client_secret` remain response aliases temporarily, but `ephemeral_token` is the canonical field and all values are opaque.

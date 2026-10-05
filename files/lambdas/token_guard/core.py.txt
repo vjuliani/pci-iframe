@@ -1,0 +1,53 @@
+import json
+
+from security import sha256_hex
+from token_guard.models import AuthorizationResult
+
+
+class EphemeralTokenGuard:
+    """Cloud-agnostic orchestration for verify -> bind -> atomic consume -> context."""
+
+    def __init__(self, *, verifier, replay_store):
+        self.verifier = verifier
+        self.replay_store = replay_store
+
+    def authorize(self, request):
+        verified = self.verifier.verify(request.token)
+        token_hash = sha256_hex(request.token)
+
+        # This is the only state transition that marks an ephemeral token USED.
+        attrs = self.replay_store.consume(
+            token_hash=token_hash,
+            request=request,
+            verified=verified,
+        )
+
+        # Provider revocation is defense-in-depth only. The replay store's
+        # atomic ACTIVE -> USED transition is authoritative.
+        revocation = 'success'
+        try:
+            self.verifier.revoke(request.token)
+        except Exception as exc:
+            revocation = 'failed'
+            print(json.dumps({
+                'event': 'TOKEN_PROVIDER_REVOCATION_FAILED',
+                'reason': str(exc),
+            }))
+
+        # For TOKEN authorizers the trusted transaction id comes from the ledger.
+        # REQUEST adapters may also supply it; if they do, the replay store verifies
+        # that it matches the ledger before this point.
+        authorized_transaction_id = str(
+            request.transaction_id or attrs.get('transaction_id') or ''
+        )
+
+        return AuthorizationResult(
+            session_id=str(attrs.get('session_id') or ''),
+            transaction_id=authorized_transaction_id,
+            merchant_sub=str(attrs.get('merchant_sub') or ''),
+            amount=str(attrs.get('amount') or ''),
+            currency=str(attrs.get('currency') or ''),
+            consumed_request_id=request.request_id,
+            token_state='USED',
+            provider_revocation=revocation,
+        )

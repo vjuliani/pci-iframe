@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HYDRA_PUBLIC_URL="${HYDRA_PUBLIC_URL:-http://localhost:4444}"
+HYDRA_ADMIN_URL="${HYDRA_ADMIN_URL:-http://localhost:4445}"
+HYDRA_CLIENT_ID="${HYDRA_CLIENT_ID:-pci-checkout-exchange}"
+HYDRA_CLIENT_SECRET="${HYDRA_CLIENT_SECRET:-dev-pci-checkout-hydra-secret-please-change-32bytes}"
+MERCHANT_ISSUER="${MERCHANT_ISSUER:-merchant-demo}"
+MERCHANT_SUBJECT="${MERCHANT_SUBJECT:-merchant_test_123}"
+PUBLIC_KEY="${MERCHANT_PUBLIC_KEY:-$ROOT/secrets/merchant-public.pem}"
+
+"$ROOT/scripts/generate_merchant_keys.sh"
+
+printf 'Waiting for Ory Hydra'
+for _ in $(seq 1 90); do
+  if curl -fsS "$HYDRA_ADMIN_URL/health/ready" >/dev/null 2>&1; then echo ' ready.'; break; fi
+  printf '.'; sleep 1
+done
+curl -fsS "$HYDRA_ADMIN_URL/health/ready" >/dev/null || { echo >&2 'ERROR: Hydra did not become ready.'; exit 1; }
+
+# Deterministic OAuth client configuration.
+curl -sS -o /dev/null -X DELETE "$HYDRA_ADMIN_URL/admin/clients/$HYDRA_CLIENT_ID" || true
+CLIENT_PAYLOAD=$(cat <<JSON
+{
+  "client_id": "$HYDRA_CLIENT_ID",
+  "client_secret": "$HYDRA_CLIENT_SECRET",
+  "client_name": "PCI checkout JWT bearer exchange",
+  "grant_types": ["urn:ietf:params:oauth:grant-type:jwt-bearer"],
+  "response_types": [],
+  "scope": "payment.execute",
+  "token_endpoint_auth_method": "client_secret_basic",
+  "access_token_strategy": "opaque"
+}
+JSON
+)
+HTTP_CODE=$(curl -sS -o /tmp/hydra-client.json -w '%{http_code}' -X POST "$HYDRA_ADMIN_URL/admin/clients" -H 'Content-Type: application/json' -d "$CLIENT_PAYLOAD")
+[[ "$HTTP_CODE" == "201" ]] || { echo >&2 "ERROR: Hydra client creation failed (HTTP $HTTP_CODE)"; cat >&2 /tmp/hydra-client.json; exit 1; }
+
+# Remove any old trust grants for this issuer so key rotations are deterministic.
+curl -sS "$HYDRA_ADMIN_URL/admin/trust/grants/jwt-bearer/issuers" -o /tmp/hydra-trust-list.json
+python3 - "$HYDRA_ADMIN_URL" "$MERCHANT_ISSUER" <<'PY'
+import json, subprocess, sys
+url, issuer = sys.argv[1:]
+try:
+    data = json.load(open('/tmp/hydra-trust-list.json'))
+except Exception:
+    data = []
+if isinstance(data, dict):
+    data = data.get('items') or data.get('issuers') or []
+for item in data if isinstance(data, list) else []:
+    if item.get('issuer') == issuer and item.get('id'):
+        subprocess.run(['curl','-sS','-o','/dev/null','-X','DELETE',f"{url}/admin/trust/grants/jwt-bearer/issuers/{item['id']}"], check=False)
+PY
+
+MOD_HEX=$(openssl rsa -pubin -in "$PUBLIC_KEY" -modulus -noout | sed 's/^Modulus=//')
+JWK_N=$(python3 - "$MOD_HEX" <<'PY'
+import base64, sys
+b=bytes.fromhex(sys.argv[1]); print(base64.urlsafe_b64encode(b).rstrip(b'=').decode())
+PY
+)
+TRUST_PAYLOAD=$(cat <<JSON
+{
+  "issuer": "$MERCHANT_ISSUER",
+  "subject": "$MERCHANT_SUBJECT",
+  "allow_any_subject": false,
+  "expires_at": "2035-01-01T00:00:00Z",
+  "scope": ["payment.execute"],
+  "jwk": {
+    "kty": "RSA",
+    "kid": "merchant-rs256-v1",
+    "use": "sig",
+    "alg": "RS256",
+    "n": "$JWK_N",
+    "e": "AQAB"
+  }
+}
+JSON
+)
+TRUST_CODE=$(curl -sS -o /tmp/hydra-trust.json -w '%{http_code}' -X POST "$HYDRA_ADMIN_URL/admin/trust/grants/jwt-bearer/issuers" -H 'Content-Type: application/json' -d "$TRUST_PAYLOAD")
+[[ "$TRUST_CODE" == "201" ]] || { echo >&2 "ERROR: Hydra trusted issuer creation failed (HTTP $TRUST_CODE)"; cat >&2 /tmp/hydra-trust.json; exit 1; }
+echo "Hydra initialized: client=$HYDRA_CLIENT_ID issuer=$MERCHANT_ISSUER subject=$MERCHANT_SUBJECT assertion_alg=RS256 access_token=opaque"

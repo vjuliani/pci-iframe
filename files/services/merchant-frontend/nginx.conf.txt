@@ -1,0 +1,10 @@
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  index index.html;
+  add_header Cache-Control "no-store" always;
+  add_header Referrer-Policy "strict-origin" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src http://localhost:3002; frame-src http://localhost:8881" always;
+  location / { try_files $uri $uri/ /index.html; }
+}

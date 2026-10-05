@@ -1,0 +1,13 @@
+# Portability
+
+The security rule is implemented in the cloud-agnostic `EphemeralTokenGuard` core:
+
+- token verifier port: Ory Hydra adapter today;
+- replay store port: DynamoDB adapter today;
+- authorizer adapter: AWS API Gateway REST TOKEN Lambda Authorizer.
+
+The core owns the only `ACTIVE -> USED` transition. The AWS adapter only translates the authorizer event and emits IAM policy/context.
+
+A TOKEN authorizer does not need to trust `X-Transaction-Id`; the ledger binds the opaque token to its transaction. The downstream Payment Checkout compares the client-supplied transaction header with the trusted transaction id returned in authorizer context.
+
+Equivalent adapters can later target Kong, Envoy `ext_authz`, NGINX `auth_request`, Redis or PostgreSQL without moving token-consumption logic into the payment service.

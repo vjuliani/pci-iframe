@@ -1,0 +1,12 @@
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  index index.html;
+  add_header Cache-Control "no-store" always;
+  add_header Referrer-Policy "no-referrer" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  # Local POC supports two explicit modes: adapter (:8890) and API Gateway.
+  # Production should restrict connect-src to the exact payment API origin.
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src http://localhost:8890 http://*.execute-api.localhost.localstack.cloud:4566; frame-ancestors http://localhost:8880" always;
+  location / { try_files $uri $uri/ /index.html; }
+}
